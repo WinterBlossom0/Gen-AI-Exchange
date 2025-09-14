@@ -245,11 +245,19 @@ def run_analysis_iter(contract_path: Path, model: str | None = None, on_partial:
 
     # Utility to summarize multiple partial outputs for purpose/plain
     def _combine_summaries(agent_factory, base_task_factory, parts: list[str], title: str) -> str:
-        combined_prompt = (
-            f"Combine and compress the following partial {title} into a single concise result. "
-            f"Keep all key points; remove duplicates. Output under 120 words.\n\n" +
-            "\n\n".join([f"Part {i+1}:\n{p}" for i, p in enumerate(parts)])
-        )
+        if title == "plain":
+            combined_prompt = (
+                "Combine these partial plain-language notes into a single simple summary for non-lawyers. "
+                "Write 8–10 bullet points only (no intro/outro), each ≤140 characters. Start lines with You:, They:, or Both:. "
+                "Keep key points, remove duplicates, and keep wording very simple.\n\n" +
+                "\n\n".join([f"Part {i+1}:\n{p}" for i, p in enumerate(parts)])
+            )
+        else:
+            combined_prompt = (
+                f"Combine and compress the following partial {title} into a single concise result. "
+                f"Keep all key points; remove duplicates. Keep under 80 words. Use 2–3 short sentences.\n\n" +
+                "\n\n".join([f"Part {i+1}:\n{p}" for i, p in enumerate(parts)])
+            )
         if 'LLM' in globals() and LLM:
             llm = LLM(model=enforced_model)
         else:

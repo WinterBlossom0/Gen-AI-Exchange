@@ -174,6 +174,13 @@ def _run_job(job_id: str, pdf_path: Path):
         JOBS[job_id]["outputs"] = {}
         model = _resolve_ollama_model()
 
+        # Make full contract text available to the frontend immediately
+        try:
+            full_text = load_pdf_text(pdf_path)
+            JOBS[job_id]["outputs"] = {**(JOBS[job_id].get("outputs") or {}), "contract_text": full_text}
+        except Exception:
+            pass
+
         outputs: Dict[str, Any] = {}
         steps = [
             ("Contract Purpose Analyst", "purpose"),
@@ -305,6 +312,7 @@ async def analyze_start(background: BackgroundTasks, file: UploadFile = File(...
         "current_agent": None,
         "current_label": None,
         "result": None,
+        "outputs": {"contract_text": load_pdf_text(pdf_path)}
     }
     background.add_task(_run_job, job_id, pdf_path)
     return AnalyzeStartResponse(job_id=job_id)

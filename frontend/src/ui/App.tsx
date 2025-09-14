@@ -28,6 +28,7 @@ export default function App() {
   const [showJson, setShowJson] = useState(false)
   const [reportJson, setReportJson] = useState<any>(null)
   const [reportLoading, setReportLoading] = useState(false)
+  const [showContract, setShowContract] = useState(false)
 
   const USE_ASYNC = true
 
@@ -184,6 +185,7 @@ export default function App() {
   }, [showJson, result])
 
   // Derived views with partial fallbacks
+  const fullText: string = (result?.contract_text ?? job?.partials?.contract_text ?? '') as string
   const plainText: string = (result?.plain ?? job?.partials?.plain ?? '') as string
   const purposeText: string = (result?.purpose ?? job?.partials?.purpose ?? '') as string
   const commercialMap: Record<string, any> | null = (result?.commercial_parsed ?? job?.partials?.commercial_parsed) || (result?.commercial ? safeParseJson<Record<string, any>>(result.commercial) : null)
@@ -216,20 +218,41 @@ export default function App() {
         </div>
       )}
 
-      {(!!plainText || !!purposeText || (commercialMap && Object.keys(commercialMap).length) || risksList.length || mitigationsList.length || alertObj) && (
+      {(!!fullText || !!plainText || !!purposeText || (commercialMap && Object.keys(commercialMap).length) || risksList.length || mitigationsList.length || alertObj) && (
         <div className="grid">
           <section className="card full">
+            <div className="row space">
+              <h2>Contract text</h2>
+              <button className="btn" onClick={() => setShowContract(v => !v)}>{showContract ? 'Hide' : 'Show'}</button>
+            </div>
+            {showContract && (
+              <pre className="pre" style={{maxHeight: 320, overflow: 'auto'}}>{fullText || '(No text extracted)'}</pre>
+            )}
+          </section>
+          <section className="card full">
             <h2>In simple terms</h2>
-            <ul className="bullets">
-              {bulletLines(plainText).map((b, i) => (
-                <li key={i}>{b}</li>
-              ))}
-            </ul>
+            {bulletLines(plainText).length > 0 ? (
+              <ul className="bullets">
+                {bulletLines(plainText).map((b, i) => (
+                  <li key={i}>{b}</li>
+                ))}
+              </ul>
+            ) : (
+              <div className="text small">Waiting for summary…</div>
+            )}
           </section>
 
           <section className="card">
             <h3>Purpose</h3>
-            <p className="text">{limitText(purposeText)}</p>
+            {bulletLines(purposeText).length > 0 ? (
+              <ul className="bullets">
+                {bulletLines(purposeText).map((b, i) => (
+                  <li key={i}>{b}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text">{limitText(purposeText)}</p>
+            )}
           </section>
 
           <section className="card">
@@ -351,7 +374,7 @@ export default function App() {
         </div>
       )}
 
-      {result && (
+          {(result || answer) && (
         <div className="chat">
           <h2>Ask questions</h2>
           <div className="row">
@@ -359,13 +382,13 @@ export default function App() {
             <button className="btn" onClick={onAsk} disabled={loading || !question.trim()}>Ask</button>
           </div>
           {answer && (
-            <div className="card">
-              <ul className="bullets">
-                {answer.split(/\r?\n/).filter(Boolean).map((line, idx) => (
-                  <li key={idx}>{line}</li>
-                ))}
-              </ul>
-            </div>
+                <div className="card">
+                  <ul className="bullets">
+                    {bulletLines(answer).map((line, idx) => (
+                      <li key={idx}>{line}</li>
+                    ))}
+                  </ul>
+                </div>
           )}
         </div>
       )}
