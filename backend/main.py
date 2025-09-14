@@ -200,6 +200,10 @@ def _run_job(job_id: str, pdf_path: Path):
             JOBS[job_id]["outputs"] = cur
 
         for idx, (label, out) in enumerate(run_analysis_iter(pdf_path, model=model, on_partial=_on_partial), start=1):
+            if JOBS.get(job_id, {}).get("cancelled"):
+                JOBS[job_id]["message"] = "Cancelled"
+                JOBS[job_id]["status"] = "cancelled"
+                return
             # Find friendly agent name
             agent_name = next((name for name, lab in steps if lab == label), label)
             JOBS[job_id]["step"] = idx
@@ -227,10 +231,15 @@ def _run_job(job_id: str, pdf_path: Path):
                 if al:
                     part["alert_parsed"] = al
             # merge into job outputs
-            cur = JOBS[job_id].get("outputs") or {}
-            cur.update(part)
-            JOBS[job_id]["outputs"] = cur
+            if not JOBS.get(job_id, {}).get("cancelled"):
+                cur = JOBS[job_id].get("outputs") or {}
+                cur.update(part)
+                JOBS[job_id]["outputs"] = cur
 
+        if JOBS.get(job_id, {}).get("cancelled"):
+            JOBS[job_id]["message"] = "Cancelled"
+            JOBS[job_id]["status"] = "cancelled"
+            return
         JOBS[job_id]["step"] = total
         JOBS[job_id]["message"] = "Saving report"
         analysis_result = AnalysisResult(
@@ -312,7 +321,8 @@ async def analyze_start(background: BackgroundTasks, file: UploadFile = File(...
         "current_agent": None,
         "current_label": None,
         "result": None,
-        "outputs": {"contract_text": load_pdf_text(pdf_path)}
+        "outputs": {"contract_text": load_pdf_text(pdf_path)},
+        "cancelled": False,
     }
     background.add_task(_run_job, job_id, pdf_path)
     return AnalyzeStartResponse(job_id=job_id)
@@ -334,6 +344,18 @@ async def analyze_status(job_id: str):
         result=job.get("result"),
         partials=job.get("outputs"),
     )
+
+
+@app.post("/analyze/cancel/{job_id}")
+async def analyze_cancel(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        return {"error": "job not found"}
+    job["cancelled"] = True
+    if job.get("status") not in {"done", "error", "cancelled"}:
+        job["status"] = "cancelled"
+        job["message"] = "Stopped by user"
+    return {"ok": True}
 
 
 class ChatRequest(BaseModel):

@@ -29,6 +29,7 @@ export default function App() {
   const [reportJson, setReportJson] = useState<any>(null)
   const [reportLoading, setReportLoading] = useState(false)
   const [showContract, setShowContract] = useState(false)
+  const [stopping, setStopping] = useState(false)
 
   const USE_ASYNC = true
 
@@ -114,6 +115,9 @@ export default function App() {
           })
           if (sdata.status === 'done' && sdata.result) {
             setResult(sdata.result)
+            return
+          }
+          if (sdata.status === 'cancelled') {
             return
           }
           if (sdata.status === 'error') {
@@ -207,7 +211,22 @@ export default function App() {
         <div className="card full" style={{ marginBottom: 16 }}>
           <div className="row space">
             <div>Step {Math.min(job.step, job.total)} / {job.total}</div>
-            <div className="text small">{job.status.toUpperCase()} {job.message ? `– ${job.message}` : ''}</div>
+            <div className="row" style={{gap: 8}}>
+              <div className="text small">{job.status.toUpperCase()} {job.message ? `– ${job.message}` : ''}</div>
+              {(job.status === 'pending' || job.status === 'running') && (
+                <button className="btn" onClick={async () => {
+                  if (!job?.id) return
+                  try {
+                    setStopping(true)
+                    await fetch(`${API}/analyze/cancel/${job.id}`, { method: 'POST' })
+                  } finally {
+                    setStopping(false)
+                  }
+                }} disabled={stopping}>
+                  {stopping ? 'Stopping…' : 'Stop'}
+                </button>
+              )}
+            </div>
           </div>
           {job.agent && (
             <div className="text small" style={{ marginTop: 6 }}>
