@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import json
 import os
 from pathlib import Path
@@ -19,6 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.main import run_analysis, run_analysis_iter, save_report, maybe_send_alert, _resolve_ollama_model, AnalysisResult  # type: ignore
+from src.utils.json_sanitizer import extract_json_object, extract_json_array  # type: ignore
 from src.utils.pdf_loader import load_pdf_text  # type: ignore
 
 app = FastAPI(title="Contract Analyzer API")
@@ -108,29 +108,22 @@ async def analyze_contract(file: UploadFile = File(...)):
     legal_risks_parsed = None
     mitigations_parsed = None
     alert_parsed = None
-    try:
-        # Commercial
-        commercial_parsed = json.loads(result.commercial)
-    except Exception:
-        commercial_parsed = None
-    try:
-        # Risks (cap count for UI)
-        legal_risks_parsed = json.loads(result.legal_risks)
-        if isinstance(legal_risks_parsed, list):
-            legal_risks_parsed = legal_risks_parsed[:8]
-    except Exception:
-        legal_risks_parsed = None
-    try:
-        mitigations_parsed = json.loads(result.mitigations)
-        if isinstance(mitigations_parsed, list):
-            mitigations_parsed = mitigations_parsed[:8]
-    except Exception:
-        mitigations_parsed = None
-    try:
-        alert_parsed = json.loads(result.alert)
-        exploitative = bool(alert_parsed.get("exploitative"))
-        rationale = alert_parsed.get("rationale")
-    except Exception:
+    # Robust parsing using sanitizer (handles extra text around JSON)
+    obj = extract_json_object(result.commercial)
+    commercial_parsed = obj if obj else None
+
+    risks = extract_json_array(result.legal_risks)[:8]
+    legal_risks_parsed = risks if risks else None
+
+    mits = extract_json_array(result.mitigations)[:8]
+    mitigations_parsed = mits if mits else None
+
+    al = extract_json_object(result.alert)
+    if al:
+        alert_parsed = al
+        exploitative = bool(al.get("exploitative"))
+        rationale = al.get("rationale")
+    else:
         alert_parsed = None
 
     # Optional email alert
@@ -169,6 +162,8 @@ class AnalyzeStatusResponse(BaseModel):
     current_agent: Optional[str] = None
     current_label: Optional[str] = None
     result: Optional[AnalyzeResponse] = None
+    # Partials as tasks complete
+    partials: Optional[Dict[str, Any]] = None
 
 
 def _run_job(job_id: str, pdf_path: Path):
@@ -176,6 +171,7 @@ def _run_job(job_id: str, pdf_path: Path):
         JOBS[job_id]["status"] = "running"
         JOBS[job_id]["step"] = 0
         JOBS[job_id]["message"] = "Starting"
+        JOBS[job_id]["outputs"] = {}
         model = _resolve_ollama_model()
 
         outputs: Dict[str, Any] = {}
@@ -199,6 +195,29 @@ def _run_job(job_id: str, pdf_path: Path):
             JOBS[job_id]["current_agent"] = agent_name
             JOBS[job_id]["current_label"] = label
             outputs[label] = out
+            # Update partials for frontend
+            part: Dict[str, Any] = {label: out}
+            # Try parsed fields
+            if label == "commercial":
+                obj = extract_json_object(out)
+                if obj:
+                    part["commercial_parsed"] = obj
+            elif label == "legal_risks":
+                arr = extract_json_array(out)
+                if arr:
+                    part["legal_risks_parsed"] = arr[:8]
+            elif label == "mitigations":
+                arr = extract_json_array(out)
+                if arr:
+                    part["mitigations_parsed"] = arr[:8]
+            elif label == "alert":
+                al = extract_json_object(out)
+                if al:
+                    part["alert_parsed"] = al
+            # merge into job outputs
+            cur = JOBS[job_id].get("outputs") or {}
+            cur.update(part)
+            JOBS[job_id]["outputs"] = cur
 
         JOBS[job_id]["step"] = total
         JOBS[job_id]["message"] = "Saving report"
@@ -221,28 +240,20 @@ def _run_job(job_id: str, pdf_path: Path):
         legal_risks_parsed = None
         mitigations_parsed = None
         alert_parsed = None
-        try:
-            commercial_parsed = json.loads(analysis_result.commercial)
-        except Exception:
-            pass
-        try:
-            legal_risks_parsed = json.loads(analysis_result.legal_risks)
-            if isinstance(legal_risks_parsed, list):
-                legal_risks_parsed = legal_risks_parsed[:8]
-        except Exception:
-            pass
-        try:
-            mitigations_parsed = json.loads(analysis_result.mitigations)
-            if isinstance(mitigations_parsed, list):
-                mitigations_parsed = mitigations_parsed[:8]
-        except Exception:
-            pass
-        try:
-            alert_parsed = json.loads(analysis_result.alert)
-            exploitative = bool(alert_parsed.get("exploitative"))
-            rationale = alert_parsed.get("rationale")
-        except Exception:
-            pass
+        obj = extract_json_object(analysis_result.commercial)
+        commercial_parsed = obj if obj else None
+
+        risks = extract_json_array(analysis_result.legal_risks)[:8]
+        legal_risks_parsed = risks if risks else None
+
+        mits = extract_json_array(analysis_result.mitigations)[:8]
+        mitigations_parsed = mits if mits else None
+
+        al = extract_json_object(analysis_result.alert)
+        if al:
+            alert_parsed = al
+            exploitative = bool(al.get("exploitative"))
+            rationale = al.get("rationale")
 
         # Reconstruct a result-like object from outputs
         JOBS[job_id]["result"] = AnalyzeResponse(
@@ -279,7 +290,17 @@ async def analyze_start(background: BackgroundTasks, file: UploadFile = File(...
         f.write(contents)
 
     job_id = os.urandom(8).hex()
-    JOBS[job_id] = {"status": "pending", "step": 0, "total_steps": 4, "message": None, "result": None}
+    # Set total_steps to the real count (+1 for saving)
+    total_steps = 6 + 1
+    JOBS[job_id] = {
+        "status": "pending",
+        "step": 0,
+        "total_steps": total_steps,
+        "message": None,
+        "current_agent": None,
+        "current_label": None,
+        "result": None,
+    }
     background.add_task(_run_job, job_id, pdf_path)
     return AnalyzeStartResponse(job_id=job_id)
 
@@ -298,6 +319,7 @@ async def analyze_status(job_id: str):
         current_agent=job.get("current_agent"),
         current_label=job.get("current_label"),
         result=job.get("result"),
+        partials=job.get("outputs"),
     )
 
 

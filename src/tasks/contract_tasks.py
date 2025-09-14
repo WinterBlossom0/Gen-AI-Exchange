@@ -3,8 +3,8 @@ from __future__ import annotations
 from crewai import Task
 
 PURPOSE_PROMPT = (
-    "You are given a contract. In 3-4 short sentences MAX, summarize: (1) primary purpose, (2) scope, (3) key deliverables. "
-    "Be concrete. No fluff, no preambles.\n\nContract:\n{contract_text}"
+    "You are given a contract. In 2-3 short sentences MAX, summarize: (1) primary purpose, (2) scope, (3) key deliverables. "
+    "Be concrete. No fluff, no preambles. <= 80 words total.\n\nContract:\n{contract_text}"
 )
 
 COMMERCIAL_PROMPT = (
@@ -28,13 +28,20 @@ ALERT_PROMPT = (
 )
 
 SIMPLIFIER_PROMPT = (
-    "Rewrite in plain language for non-lawyers. MAX 8 bullets, each <= 140 chars. Focus on: purpose, duties (both sides), payments, timelines, risks (who they favor), watch-outs. "
-    "No intro or outro.\n\nContract:\n{contract_text}"
+    "Explain the contract so someone with very low literacy can understand without losing legal nuance. "
+    "Use very simple words and short phrases. Avoid legal jargon; if a legal term must appear, explain it in brackets, e.g., indemnity (who pays for harm). "
+    "OUTPUT: 8-10 bullets, each <= 140 chars. Start bullets with You:, They:, or Both: for clarity. "
+    "Cover, if present: purpose; who does what; money (how much, when); time limits; changes/scope; IP ownership; secrets (confidentiality); damage limits (caps); who pays if things go wrong (indemnity); ending early (termination); which law/court; penalties/late fees; data privacy; warranties; acceptance/tests. "
+    "End with 1-2 bullets of Watch out: biggest risks to you. No intro or outro.\n\nContract:\n{contract_text}"
 )
 
 CHAT_PROMPT = (
-    "Answer the question based ONLY on the contract and analysis. 3-6 concise sentences. Start with the direct answer; include clause refs in parentheses. "
-    "Avoid restating the whole contract.\n\nContract:\n{contract_text}\n\nAnalysis:\n{analysis}\n\nQuestion:\n{question}"
+    "Answer ONLY the user question using the contract and analysis. Do not invent facts. If not stated, say 'Not stated in the contract.' "
+    "Format: \n"
+    "- First line: Direct answer (<= 20 words). If yes/no, start with Yes. or No.\n"
+    "- Second line: Brief reason with clause reference(s) in parentheses, e.g., (Clause 5, Termination).\n"
+    "- If the question has parts, label A), B).\n"
+    "Keep total under 100 words.\n\nContract:\n{contract_text}\n\nAnalysis:\n{analysis}\n\nQuestion:\n{question}"
 )
 
 

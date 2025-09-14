@@ -1,6 +1,21 @@
-import React, { ChangeEvent, useMemo, useState } from 'react'
+import React, { ChangeEvent, useEffect, useMemo, useState } from 'react'
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+
+type JobState = {
+  id: string
+  status: string
+  step: number
+  total: number
+  message?: string
+  agent?: string
+  label?: string
+  partials?: any
+}
+
+type Risk = { clause: string; risk: string; fairness: string; favours: string; severity: string }
+type Mitigation = { clause: string; mitigation: string; negotiation_points?: string }
+type AlertDecision = { exploitative: boolean; rationale?: string; top_unfair_clauses?: string[] }
 
 export default function App() {
   const [file, setFile] = useState<File | null>(null)
@@ -8,9 +23,36 @@ export default function App() {
   const [result, setResult] = useState<any>(null)
   const [question, setQuestion] = useState('')
   const [answer, setAnswer] = useState('')
-  const [job, setJob] = useState<{ id: string; status: string; step: number; total: number; message?: string; agent?: string; label?: string } | null>(null)
+  const [job, setJob] = useState<JobState | null>(null)
+  const [restored, setRestored] = useState(false)
+  const [showJson, setShowJson] = useState(false)
+  const [reportJson, setReportJson] = useState<any>(null)
+  const [reportLoading, setReportLoading] = useState(false)
 
   const USE_ASYNC = true
+
+  // restore persisted state on first load
+  useEffect(() => {
+    try {
+      const j = localStorage.getItem('job')
+      const r = localStorage.getItem('result')
+      if (j) setJob(JSON.parse(j))
+      if (r) setResult(JSON.parse(r))
+    } catch {}
+    setRestored(true)
+  }, [])
+
+  // persist on change
+  useEffect(() => {
+    try {
+      job ? localStorage.setItem('job', JSON.stringify(job)) : localStorage.removeItem('job')
+    } catch {}
+  }, [job])
+  useEffect(() => {
+    try {
+      result ? localStorage.setItem('result', JSON.stringify(result)) : localStorage.removeItem('result')
+    } catch {}
+  }, [result])
 
   const canAnalyze = useMemo(() => !!file && !loading, [file, loading])
 
@@ -23,28 +65,14 @@ export default function App() {
     }
   }
 
-  const parsed = useMemo(() => {
-    if (!result) return { commercial: null, risks: null, mitigations: null, alert: null }
-    // Prefer backend-parsed fields, fallback to local parse
-    const commercial = result.commercial_parsed ?? safeParseJson<Record<string, string>>(result.commercial)
-    const risks = result.legal_risks_parsed ?? safeParseJson<Array<{ clause: string; risk: string; fairness: string; favours: string; severity: string }>>(result.legal_risks)
-    const mitigations = result.mitigations_parsed ?? safeParseJson<Array<{ clause: string; mitigation: string; negotiation_points?: string }>>(result.mitigations)
-    const alert = result.alert_parsed ?? safeParseJson<{ exploitative: boolean; rationale?: string; top_unfair_clauses?: string[] }>(result.alert)
-    return { commercial, risks, mitigations, alert }
-  }, [result])
-
   const bulletLines = (text: string): string[] => {
     if (!text) return []
-    const lines = text
-      .split(/\r?\n/)
-      .map(l => l.trim())
-      .filter(Boolean)
-    // If lines look like bullets already, keep them; otherwise, take first 8 sentences-like chunks
+    const lines = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean)
     if (lines.some(l => /^[-*•]/.test(l))) {
-      return lines.map(l => l.replace(/^[-*•]\s*/, '')).slice(0, 8)
+      return lines.map(l => l.replace(/^[-*•]\s*/, '')).slice(0, 10)
     }
     const chunks = text.split(/[\n\r]+|(?<=[.!?])\s+/).map(s => s.trim()).filter(Boolean)
-    return chunks.slice(0, 8)
+    return chunks.slice(0, 10)
   }
 
   const limitText = (text: string, max = 360): string => {
@@ -57,21 +85,32 @@ export default function App() {
     if (!file) return
     setLoading(true)
     setAnswer('')
+    setResult(null)
     try {
       const form = new FormData()
       form.append('file', file)
       if (USE_ASYNC) {
-        // Start job
         const start = await fetch(`${API}/analyze/start`, { method: 'POST', body: form })
         const startData = await start.json()
         if (!start.ok || !startData.job_id) throw new Error('Failed to start analysis')
         const jobId = startData.job_id as string
-        setJob({ id: jobId, status: 'pending', step: 0, total: 4 })
-        // Poll status
+        setJob({ id: jobId, status: 'pending', step: 0, total: 7 })
+
         const poll = async () => {
           const st = await fetch(`${API}/analyze/status/${jobId}`)
           const sdata = await st.json()
-          setJob({ id: jobId, status: sdata.status, step: sdata.step, total: sdata.total_steps, message: sdata.message, agent: sdata.current_agent, label: sdata.current_label })
+          const total = sdata.total_steps || 7
+          const step = sdata.step || 0
+          setJob({
+            id: jobId,
+            status: sdata.status,
+            step,
+            total,
+            message: sdata.message,
+            agent: sdata.current_agent,
+            label: sdata.current_label,
+            partials: sdata.partials,
+          })
           if (sdata.status === 'done' && sdata.result) {
             setResult(sdata.result)
             return
@@ -87,8 +126,8 @@ export default function App() {
         const data = await res.json()
         setResult(data)
       }
-    } catch (e:any) {
-      alert('Upload failed. Make sure the backend is running at ' + API + ' and try again.\n' + (e?.message || e))
+    } catch (e: any) {
+      alert('Upload failed. Make sure the backend is running at ' + API + '\n' + (e?.message || e))
     } finally {
       setLoading(false)
     }
@@ -112,16 +151,45 @@ export default function App() {
             plain: result.plain,
           }),
           question,
-        })
+        }),
       })
       const data = await res.json()
       setAnswer(data.answer || '')
-    } catch (e:any) {
+    } catch (e: any) {
       alert('Chat failed: ' + (e?.message || e))
     } finally {
       setLoading(false)
     }
   }
+
+  // Load saved JSON report on demand
+  useEffect(() => {
+    const fetchReport = async () => {
+      if (!result?.report_url || !showJson) return
+      try {
+        setReportLoading(true)
+        setReportJson(null)
+        const url = `${API.replace(/\/$/, '')}${result.report_url}`
+        const res = await fetch(url)
+        if (!res.ok) throw new Error('Failed to load JSON report')
+        const data = await res.json()
+        setReportJson(data)
+      } catch (e) {
+        setReportJson({ error: 'Could not load report JSON' })
+      } finally {
+        setReportLoading(false)
+      }
+    }
+    fetchReport()
+  }, [showJson, result])
+
+  // Derived views with partial fallbacks
+  const plainText: string = (result?.plain ?? job?.partials?.plain ?? '') as string
+  const purposeText: string = (result?.purpose ?? job?.partials?.purpose ?? '') as string
+  const commercialMap: Record<string, any> | null = (result?.commercial_parsed ?? job?.partials?.commercial_parsed) || (result?.commercial ? safeParseJson<Record<string, any>>(result.commercial) : null)
+  const risksList: Risk[] = (result?.legal_risks_parsed ?? job?.partials?.legal_risks_parsed) || (result?.legal_risks ? (safeParseJson<Risk[]>(result.legal_risks) || []) : [])
+  const mitigationsList: Mitigation[] = (result?.mitigations_parsed ?? job?.partials?.mitigations_parsed) || (result?.mitigations ? (safeParseJson<Mitigation[]>(result.mitigations) || []) : [])
+  const alertObj: AlertDecision | null = (result?.alert_parsed ?? job?.partials?.alert_parsed) || (result?.alert ? safeParseJson<AlertDecision>(result.alert) : null)
 
   return (
     <div className="container">
@@ -134,41 +202,41 @@ export default function App() {
       </div>
 
       {job && (
-        <div className="card full" style={{marginBottom: 16}}>
+        <div className="card full" style={{ marginBottom: 16 }}>
           <div className="row space">
-            <div>Step {job.step} / {job.total}</div>
+            <div>Step {Math.min(job.step, job.total)} / {job.total}</div>
             <div className="text small">{job.status.toUpperCase()} {job.message ? `– ${job.message}` : ''}</div>
           </div>
           {job.agent && (
-            <div className="text small" style={{marginTop: 6}}>
-              Working: <strong>{job.agent}</strong> ({job.label})
+            <div className="text small" style={{ marginTop: 6 }}>
+              Working: <strong>{job.agent}</strong> {job.label ? `(${job.label})` : ''}
             </div>
           )}
-          <div className="progress">
-            <div className="bar" style={{width: `${(Math.max(0, Math.min(job.step, job.total)) / job.total) * 100}%`}} />
-          </div>
+          <div className="progress"><div className="bar" style={{ width: `${job.total > 0 ? (Math.max(0, Math.min(job.step, job.total)) / job.total) * 100 : 0}%` }} /></div>
         </div>
       )}
 
-      {result && (
+      {(!!plainText || !!purposeText || (commercialMap && Object.keys(commercialMap).length) || risksList.length || mitigationsList.length || alertObj) && (
         <div className="grid">
           <section className="card full">
             <h2>In simple terms</h2>
             <ul className="bullets">
-              {bulletLines(result.plain).map((b, i) => (
+              {bulletLines(plainText).map((b, i) => (
                 <li key={i}>{b}</li>
               ))}
             </ul>
           </section>
+
           <section className="card">
             <h3>Purpose</h3>
-            <p className="text">{limitText(result.purpose)}</p>
+            <p className="text">{limitText(purposeText)}</p>
           </section>
+
           <section className="card">
             <h3>Commercial</h3>
-            {parsed.commercial ? (
+            {commercialMap && Object.keys(commercialMap).length > 0 ? (
               <dl className="kv">
-                {Object.entries(parsed.commercial).map(([k, v]) => (
+                {Object.entries(commercialMap).map(([k, v]) => (
                   <div className="kv-row" key={k}>
                     <dt>{k.replace(/_/g, ' ')}</dt>
                     <dd>{String((v as unknown) ?? '—')}</dd>
@@ -176,12 +244,13 @@ export default function App() {
                 ))}
               </dl>
             ) : (
-              <pre className="pre">{result.commercial}</pre>
+              <div className="text small">No commercial terms parsed. Check the JSON Summary for raw output.</div>
             )}
           </section>
+
           <section className="card">
             <h3>Legal Risks</h3>
-            {Array.isArray(parsed.risks) ? (
+            {Array.isArray(risksList) && risksList.length > 0 ? (
               <div className="table-wrap">
                 <table className="table">
                   <thead>
@@ -194,25 +263,26 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {parsed.risks.map((r, idx) => (
+                    {risksList.map((r, idx) => (
                       <tr key={idx}>
                         <td>{r.clause}</td>
                         <td>{r.risk}</td>
                         <td><span className={`badge ${r.fairness === 'unfair' ? 'bad' : 'good'}`}>{r.fairness}</span></td>
                         <td>{r.favours}</td>
-                        <td><span className={`badge sev-${(r.severity||'').toLowerCase()}`}>{r.severity}</span></td>
+                        <td><span className={`badge sev-${(r.severity || '').toLowerCase()}`}>{r.severity}</span></td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
             ) : (
-              <pre className="pre">{result.legal_risks}</pre>
+              <div className="text small">No legal risks parsed. Check the JSON Summary for raw output.</div>
             )}
           </section>
+
           <section className="card">
             <h3>Mitigations</h3>
-            {Array.isArray(parsed.mitigations) ? (
+            {Array.isArray(mitigationsList) && mitigationsList.length > 0 ? (
               <div className="table-wrap">
                 <table className="table">
                   <thead>
@@ -223,7 +293,7 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {parsed.mitigations.map((m, idx) => (
+                    {mitigationsList.map((m, idx) => (
                       <tr key={idx}>
                         <td>{m.clause}</td>
                         <td>{m.mitigation}</td>
@@ -234,34 +304,48 @@ export default function App() {
                 </table>
               </div>
             ) : (
-              <pre className="pre">{result.mitigations}</pre>
+              <div className="text small">No mitigations parsed. Check the JSON Summary for raw output.</div>
             )}
           </section>
+
           <section className="card">
             <h3>Exploitative?</h3>
-            {parsed.alert ? (
+            {alertObj ? (
               <div>
                 <div className="row space">
-                  <span className={`pill ${parsed.alert.exploitative ? 'pill-bad' : 'pill-good'}`}>
-                    {parsed.alert.exploitative ? 'Exploitative' : 'Not exploitative'}
+                  <span className={`pill ${alertObj.exploitative ? 'pill-bad' : 'pill-good'}`}>
+                    {alertObj.exploitative ? 'Exploitative' : 'Not exploitative'}
                   </span>
                 </div>
-                {parsed.alert.rationale && <p className="text small">{parsed.alert.rationale}</p>}
-                {parsed.alert.top_unfair_clauses?.length ? (
+                {alertObj.rationale && <p className="text small">{alertObj.rationale}</p>}
+                {alertObj.top_unfair_clauses?.length ? (
                   <ul className="bullets compact">
-                    {parsed.alert.top_unfair_clauses.slice(0, 5).map((c: string, i: number) => (
+                    {alertObj.top_unfair_clauses.slice(0, 5).map((c: string, i: number) => (
                       <li key={i}>{c}</li>
                     ))}
                   </ul>
                 ) : null}
               </div>
             ) : (
-              <pre className="pre">{result.alert}</pre>
+              <div className="text small">No decision yet.</div>
             )}
           </section>
-          {result.report_url && (
+
+          {result?.report_url && (
             <section className="card full">
-              <a className="link" href={`${API.replace(/\/$/, '')}${result.report_url}`} target="_blank" rel="noreferrer">Download JSON report</a>
+              <div className="row space">
+                <a className="link" href={`${API.replace(/\/$/, '')}${result.report_url}`} target="_blank" rel="noreferrer">Download JSON report</a>
+                <button className="btn" onClick={() => setShowJson(v => !v)}>
+                  {showJson ? 'Hide JSON Summary' : 'Show JSON Summary'}
+                </button>
+              </div>
+              {showJson && (
+                reportLoading ? (
+                  <div className="text small" style={{ marginTop: 8 }}>Loading JSON…</div>
+                ) : (
+                  <pre className="pre" style={{ marginTop: 8 }}>{JSON.stringify(reportJson ?? { note: 'No report loaded' }, null, 2)}</pre>
+                )
+              )}
             </section>
           )}
         </div>
@@ -275,7 +359,13 @@ export default function App() {
             <button className="btn" onClick={onAsk} disabled={loading || !question.trim()}>Ask</button>
           </div>
           {answer && (
-            <pre className="pre answer">{answer}</pre>
+            <div className="card">
+              <ul className="bullets">
+                {answer.split(/\r?\n/).filter(Boolean).map((line, idx) => (
+                  <li key={idx}>{line}</li>
+                ))}
+              </ul>
+            </div>
           )}
         </div>
       )}

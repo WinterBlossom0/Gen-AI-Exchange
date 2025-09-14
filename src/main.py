@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict
 
-from crewai import Crew, Process
+from crewai import Crew, Process, Task
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
@@ -80,41 +81,23 @@ def _resolve_ollama_model() -> str:
     if not os.getenv("OLLAMA_BASE_URL"):
         os.environ["OLLAMA_BASE_URL"] = os.getenv("OLLAMA_HOST", default_host)
 
+    # Timeout policy: default to effectively "no timeout" unless user overrides.
+    # Some wrappers treat 0 as immediate timeout; use a very large number (1 year in seconds).
+    # You can still override via TASK_TIMEOUT_SEC or LITELLM_TIMEOUT env vars.
+    very_long_timeout = os.getenv("TASK_TIMEOUT_SEC") or os.getenv("LITELLM_TIMEOUT") or str(365 * 24 * 60 * 60)
+    os.environ["LITELLM_TIMEOUT"] = very_long_timeout
+    os.environ.setdefault("LITELLM_MAX_RETRIES", "1")
+
     # Allow override via OLLAMA_MODEL; default to gemma3:1b
     model = os.getenv("OLLAMA_MODEL", "ollama/gemma3:1b")
     return model
 
 
 def run_analysis(contract_path: Path, model: str | None = None) -> AnalysisResult:
-    text = load_pdf_text(contract_path)
-
-    # Build agents and tasks
-    agents, tasks, labels = build_agents_and_tasks(text, model)
-
-    crew = Crew(
-        agents=agents,
-        tasks=tasks,
-        process=Process.sequential,
-        verbose=True,
-    )
-
-    result = crew.kickoff()
-
-    # CrewAI returns a string or dict-like; to keep simple, collect tool outputs off tasks
+    # Reuse iterator path to leverage chunked heavy-task processing
     outputs: Dict[str, Any] = {}
-    for label, task in zip(labels, tasks):
-        try:
-            # CrewAI task output may be in task.output or returned in result dict; handle robustly
-            if hasattr(task, "output") and task.output is not None:
-                raw = getattr(task.output, "raw", None)
-                outputs[label] = raw if raw is not None else str(task.output)
-            elif isinstance(result, dict) and label in result:
-                outputs[label] = result[label]
-            else:
-                outputs[label] = ""
-        except Exception:
-            outputs[label] = ""
-
+    for label, out in run_analysis_iter(contract_path, model=model):
+        outputs[label] = out
     return AnalysisResult(
         purpose=str(outputs.get("purpose", "")),
         commercial=str(outputs.get("commercial", "")),
@@ -147,7 +130,7 @@ def build_agents_and_tasks(contract_text: str, model: str | None = None):
         alert_task(alert_agent),
         simplifier_task(simplifier_agent),
     ]
-    # Inject context safely
+    # Inject full contract text for all base tasks; chunking logic will handle very large inputs per-step
     for t in tasks:
         t.description = t.description.replace("{contract_text}", contract_text)
 
@@ -157,18 +140,274 @@ def build_agents_and_tasks(contract_text: str, model: str | None = None):
 
 
 def run_analysis_iter(contract_path: Path, model: str | None = None):
-    """Yield (label, output_string) per task sequentially to support progress reporting."""
+    """Yield (label, output_string) per task sequentially to support progress reporting.
+    Heavy tasks (legal_risks, mitigations) are chunked and can run partially in parallel.
+    The alert decision is derived from merged risks to avoid long calls.
+    """
     text = load_pdf_text(contract_path)
-    agents, tasks, labels = build_agents_and_tasks(text, model)
-    for agent, task, label in zip(agents, tasks, labels):
+    enforced_model = model or _resolve_ollama_model()
+    agents, tasks, labels = build_agents_and_tasks(text, enforced_model)
+
+    # Keep outputs so alert can use risks
+    outputs: Dict[str, str] = {}
+
+    # Helpers to run a single task and get output string
+    def _run_single(agent, task) -> str:
         crew = Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False)
         _ = crew.kickoff()
-        out = ""
         try:
-            out = task.output.raw if hasattr(task, "output") else str(task.output)
+            return task.output.raw if hasattr(task, "output") else str(task.output)
         except Exception:
-            out = ""
-        yield label, str(out or "")
+            return ""
+
+    # Chunking helpers
+    def _chunk_text(txt: str, chunk_chars: int, overlap: int = 400):
+        if len(txt) <= chunk_chars:
+            return [txt]
+        chunks = []
+        i = 0
+        while i < len(txt):
+            end = min(len(txt), i + chunk_chars)
+            chunks.append(txt[i:end])
+            if end == len(txt):
+                break
+            i = max(end - overlap, i + 1)
+        return chunks
+
+    def _safe_json_list(val: str):
+        try:
+            data = json.loads(val)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _merge_risks(risks_list):
+        # Deduplicate by normalized clause text; rank by severity and unfairness
+        def score(r):
+            sev = (r.get("severity", "").lower())
+            s = 3 if sev == "high" else 2 if sev == "medium" else 1 if sev == "low" else 0
+            if str(r.get("fairness", "")).lower() == "unfair":
+                s += 1
+            return s
+        by_clause: Dict[str, Dict[str, Any]] = {}
+        for r in risks_list:
+            clause = str(r.get("clause", "")).strip()
+            if not clause:
+                continue
+            key = clause.lower()
+            if key not in by_clause or score(r) > score(by_clause[key]):
+                by_clause[key] = r
+        merged = sorted(by_clause.values(), key=score, reverse=True)
+        return merged[:8]
+
+    def _merge_mitigations(mits_list, keep_for_clauses):
+        # Keep items matching the top risk clauses first
+        wanted = {c.lower() for c in keep_for_clauses}
+        picked = []
+        seen = set()
+        for m in mits_list:
+            clause = str(m.get("clause", ""))
+            if not clause:
+                continue
+            key = clause.lower()
+            if key in seen:
+                continue
+            if key in wanted:
+                picked.append(m)
+                seen.add(key)
+        # If fewer than 8, fill with the rest
+        if len(picked) < 8:
+            for m in mits_list:
+                clause = str(m.get("clause", ""))
+                key = clause.lower()
+                if not clause or key in seen:
+                    continue
+                picked.append(m)
+                seen.add(key)
+                if len(picked) >= 8:
+                    break
+        return picked[:8]
+
+    def _alert_from_risks(risks):
+        unfair = [r for r in risks if str(r.get("fairness", "")).lower() == "unfair"]
+        high_unfair = [r for r in unfair if str(r.get("severity", "")).lower() == "high"]
+        exploit = bool(len(high_unfair) >= 1 or len(unfair) >= 3)
+        top_clauses = [r.get("clause", "") for r in risks[:5] if r.get("clause")]
+        rationale = (
+            f"{len(unfair)} unfair clause(s), {len(high_unfair)} high severity. "
+            + ("Leans exploitative." if exploit else "Overall balanced/negotiable.")
+        )
+        return json.dumps({
+            "exploitative": exploit,
+            "rationale": rationale,
+            "top_unfair_clauses": top_clauses,
+        }, ensure_ascii=False)
+
+    # Utility to summarize multiple partial outputs for purpose/plain
+    def _combine_summaries(agent_factory, base_task_factory, parts: list[str], title: str) -> str:
+        combined_prompt = (
+            f"Combine and compress the following partial {title} into a single concise result. "
+            f"Keep all key points; remove duplicates. Output under 120 words.\n\n" +
+            "\n\n".join([f"Part {i+1}:\n{p}" for i, p in enumerate(parts)])
+        )
+        if 'LLM' in globals() and LLM:
+            llm = LLM(model=enforced_model)
+        else:
+            llm = None
+        agent = agent_factory(llm)
+        # Create a one-off task to combine
+        task = Task(description=combined_prompt, agent=agent, expected_output=f"Combined {title}")
+        crew = Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False)
+        _ = crew.kickoff()
+        try:
+            return task.output.raw if hasattr(task, "output") else str(task.output)
+        except Exception:
+            return ""
+
+    # Main loop with special handling for heavy steps
+    for agent, task, label in zip(agents, tasks, labels):
+        if label in ("legal_risks", "mitigations"):
+            # Build chunk tasks
+            CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "6000"))
+            CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "600"))
+            env_par = os.getenv("CHUNK_PARALLEL")
+            if env_par:
+                PAR = max(1, int(env_par))
+            else:
+                cpu = os.cpu_count() or 2
+                PAR = max(2, cpu)  # default: use all available cores
+            chunks = _chunk_text(text, CHUNK_CHARS, CHUNK_OVERLAP)
+            PAR = min(PAR, max(1, len(chunks)))
+
+            # Build a fresh task per chunk
+            def build_chunk_task(chunk_text: str):
+                # Build a fresh agent per chunk to avoid any cross-run state and allow safe parallelism
+                from src.tasks.contract_tasks import legal_risk_task, mitigation_task  # local import to avoid cycles
+                if 'LLM' in globals() and LLM:
+                    llm = LLM(model=enforced_model)
+                else:
+                    llm = None
+                from src.agents.contract_agents import make_legal_risk_agent, make_mitigation_agent
+                chunk_agent = make_legal_risk_agent(llm) if label == "legal_risks" else make_mitigation_agent(llm)
+                if label == "legal_risks":
+                    t = legal_risk_task(chunk_agent)
+                else:
+                    t = mitigation_task(chunk_agent)
+                t.description = t.description.replace("{contract_text}", chunk_text)
+                return t
+
+            results = []
+            # Parallel execution of chunk tasks
+            with ThreadPoolExecutor(max_workers=PAR) as ex:
+                fut_map = {ex.submit(_run_single, None, build_chunk_task(c)): idx for idx, c in enumerate(chunks)}
+                for fut in as_completed(fut_map):
+                    try:
+                        results.append(fut.result())
+                    except Exception:
+                        results.append("[]")
+
+            # Merge arrays
+            merged_items = []
+            for r in results:
+                merged_items.extend(_safe_json_list(str(r)))
+
+            if label == "legal_risks":
+                merged = _merge_risks(merged_items)
+                out = json.dumps(merged, ensure_ascii=False)
+                outputs[label] = out
+                yield label, out
+            else:
+                # Use risk clauses for alignment if available
+                risk_list = _safe_json_list(outputs.get("legal_risks", "[]"))
+                keep_clauses = [r.get("clause", "") for r in risk_list if r.get("clause")]
+                merged = _merge_mitigations(merged_items, keep_clauses)
+                out = json.dumps(merged, ensure_ascii=False)
+                outputs[label] = out
+                yield label, out
+        elif label == "alert":
+            # Derive from risks to avoid another heavy call
+            risk_list = _safe_json_list(outputs.get("legal_risks", "[]"))
+            out = _alert_from_risks(risk_list)
+            outputs[label] = out
+            yield label, out
+        else:
+            # Process entire PDF via chunking for purpose/commercial/plain with parallelism
+            CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "6000"))
+            CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "600"))
+            chunks = _chunk_text(text, CHUNK_CHARS, CHUNK_OVERLAP)
+            env_par = os.getenv("CHUNK_PARALLEL")
+            if env_par:
+                PAR = max(1, int(env_par))
+            else:
+                cpu = os.cpu_count() or 2
+                PAR = max(2, cpu)
+            PAR = min(PAR, max(1, len(chunks)))
+
+            def build_light_chunk_task(chunk_text: str):
+                # fresh agent per chunk
+                if 'LLM' in globals() and LLM:
+                    llm = LLM(model=enforced_model)
+                else:
+                    llm = None
+                from src.agents.contract_agents import (
+                    make_purpose_agent,
+                    make_commercial_agent,
+                    make_simplifier_agent,
+                )
+                from src.tasks.contract_tasks import (
+                    purpose_task as _p_task,
+                    commercial_task as _c_task,
+                    simplifier_task as _s_task,
+                )
+                if label == "purpose":
+                    a = make_purpose_agent(llm); t = _p_task(a)
+                elif label == "commercial":
+                    a = make_commercial_agent(llm); t = _c_task(a)
+                else:
+                    a = make_simplifier_agent(llm); t = _s_task(a)
+                t.description = t.description.replace("{contract_text}", chunk_text)
+                return a, t
+
+            partials: list[str] = []
+            with ThreadPoolExecutor(max_workers=PAR) as ex:
+                fut_map = {}
+                for c in chunks:
+                    a, t = build_light_chunk_task(c)
+                    fut_map[ex.submit(_run_single, a, t)] = True
+                for fut in as_completed(fut_map):
+                    try:
+                        partials.append(fut.result())
+                    except Exception:
+                        partials.append("")
+
+            if label == "commercial":
+                # Merge commercial JSON objects over chunks
+                try:
+                    merged: Dict[str, Any] = {}
+                    for p in partials:
+                        obj = {}
+                        try:
+                            obj = json.loads(p)
+                        except Exception:
+                            from src.utils.json_sanitizer import extract_json_object
+                            obj = extract_json_object(str(p)) or {}
+                        if isinstance(obj, dict):
+                            for k, v in obj.items():
+                                if v and k not in merged:
+                                    merged[k] = v
+                    out = json.dumps(merged, ensure_ascii=False)
+                except Exception:
+                    out = partials[0] if partials else ""
+            else:
+                # Combine summaries
+                from src.agents.contract_agents import make_purpose_agent, make_simplifier_agent
+                agent_factory = make_purpose_agent if label == "purpose" else make_simplifier_agent
+                from src.tasks.contract_tasks import purpose_task, simplifier_task
+                base_task_factory = purpose_task if label == "purpose" else simplifier_task
+                out = _combine_summaries(agent_factory, base_task_factory, partials, title=label)
+
+            outputs[label] = str(out or "")
+            yield label, str(out or "")
 
 
 def maybe_send_alert(alert_json: str, contract_name: str) -> None:
@@ -187,15 +426,43 @@ def maybe_send_alert(alert_json: str, contract_name: str) -> None:
 def save_report(result: AnalysisResult, out_dir: Path, contract_name: str) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{contract_name}_analysis.json"
-    with out_path.open("w", encoding="utf-8") as f:
-        json.dump({
+    # Try to parse structured fields
+    def _try_json(x):
+        try:
+            return json.loads(x)
+        except Exception:
+            return None
+    def _bullets(text: str, n=10):
+        if not text:
+            return []
+        lines = [l.strip().lstrip("-*• ") for l in text.splitlines() if l.strip()]
+        if lines:
+            return lines[:n]
+        chunks = [c.strip() for c in text.split(". ") if c.strip()]
+        return chunks[:n]
+
+    commercial_parsed = _try_json(result.commercial)
+    legal_risks_parsed = _try_json(result.legal_risks)
+    mitigations_parsed = _try_json(result.mitigations)
+    alert_parsed = _try_json(result.alert)
+
+    report = {
+        "summary": {
             "purpose": result.purpose,
-            "commercial": result.commercial,
-            "legal_risks": result.legal_risks,
-            "mitigations": result.mitigations,
-            "alert": result.alert,
-            "plain": result.plain,
-        }, f, ensure_ascii=False, indent=2)
+            "plain_bullets": _bullets(result.plain, 10),
+        },
+        "commercial": commercial_parsed if isinstance(commercial_parsed, dict) else result.commercial,
+        "legal_risks": legal_risks_parsed if isinstance(legal_risks_parsed, list) else result.legal_risks,
+        "mitigations": mitigations_parsed if isinstance(mitigations_parsed, list) else result.mitigations,
+        "decision": alert_parsed if isinstance(alert_parsed, dict) else result.alert,
+        "meta": {
+            "contract": contract_name,
+            "model": os.getenv("OLLAMA_MODEL", "ollama/gemma3:1b"),
+        }
+    }
+
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
     # Also write a human-friendly markdown
     md_path = out_dir / f"{contract_name}_analysis.md"
     md = [

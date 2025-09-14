@@ -1,13 +1,8 @@
 crewai>=0.28.8
 python-dotenv>=1.0.1
 pydantic>=2.7.0
-pydantic-settings>=2.3.1
 pypdf>=4.2.0
-pdfminer.six>=20240706
-rapidfuzz>=3.9.6
 email-validator>=2.1.0.post1
 rich>=13.7.1
-click>=8.1.7
-orjson>=3.10.7
 fastapi>=0.115.0
 uvicorn>=0.30.0
