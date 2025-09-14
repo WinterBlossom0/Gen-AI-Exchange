@@ -8,7 +8,7 @@ export default function App() {
   const [result, setResult] = useState<any>(null)
   const [question, setQuestion] = useState('')
   const [answer, setAnswer] = useState('')
-  const [job, setJob] = useState<{ id: string; status: string; step: number; total: number; message?: string } | null>(null)
+  const [job, setJob] = useState<{ id: string; status: string; step: number; total: number; message?: string; agent?: string; label?: string } | null>(null)
 
   const USE_ASYNC = true
 
@@ -71,7 +71,7 @@ export default function App() {
         const poll = async () => {
           const st = await fetch(`${API}/analyze/status/${jobId}`)
           const sdata = await st.json()
-          setJob({ id: jobId, status: sdata.status, step: sdata.step, total: sdata.total_steps, message: sdata.message })
+          setJob({ id: jobId, status: sdata.status, step: sdata.step, total: sdata.total_steps, message: sdata.message, agent: sdata.current_agent, label: sdata.current_label })
           if (sdata.status === 'done' && sdata.result) {
             setResult(sdata.result)
             return
@@ -139,6 +139,11 @@ export default function App() {
             <div>Step {job.step} / {job.total}</div>
             <div className="text small">{job.status.toUpperCase()} {job.message ? `– ${job.message}` : ''}</div>
           </div>
+          {job.agent && (
+            <div className="text small" style={{marginTop: 6}}>
+              Working: <strong>{job.agent}</strong> ({job.label})
+            </div>
+          )}
           <div className="progress">
             <div className="bar" style={{width: `${(Math.max(0, Math.min(job.step, job.total)) / job.total) * 100}%`}} />
           </div>

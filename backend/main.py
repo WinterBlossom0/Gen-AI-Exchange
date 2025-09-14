@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.main import run_analysis, save_report, maybe_send_alert, _resolve_ollama_model  # type: ignore
+from src.main import run_analysis, run_analysis_iter, save_report, maybe_send_alert, _resolve_ollama_model, AnalysisResult  # type: ignore
 from src.utils.pdf_loader import load_pdf_text  # type: ignore
 
 app = FastAPI(title="Contract Analyzer API")
@@ -154,24 +154,51 @@ class AnalyzeStatusResponse(BaseModel):
     step: int
     total_steps: int
     message: Optional[str] = None
+    current_agent: Optional[str] = None
+    current_label: Optional[str] = None
     result: Optional[AnalyzeResponse] = None
 
 
 def _run_job(job_id: str, pdf_path: Path):
     try:
         JOBS[job_id]["status"] = "running"
-        JOBS[job_id]["step"] = 1
-        JOBS[job_id]["message"] = "Reading PDF"
-        _ = load_pdf_text(pdf_path)
-
-        JOBS[job_id]["step"] = 2
-        JOBS[job_id]["message"] = "Analyzing: agents running"
+        JOBS[job_id]["step"] = 0
+        JOBS[job_id]["message"] = "Starting"
         model = _resolve_ollama_model()
-        result = run_analysis(pdf_path, model=model)
 
-        JOBS[job_id]["step"] = 3
+        outputs: Dict[str, Any] = {}
+        steps = [
+            ("Contract Purpose Analyst", "purpose"),
+            ("Commercial Clauses Analyst", "commercial"),
+            ("Legal Risk Assessor", "legal_risks"),
+            ("Mitigation Strategist", "mitigations"),
+            ("Exploitative Contract Detector", "alert"),
+            ("Plain-Language Simplifier", "plain"),
+        ]
+        total = len(steps) + 1  # +1 for saving report
+        JOBS[job_id]["total_steps"] = total
+
+        # Iterate tasks sequentially and update status
+        for idx, (label, out) in enumerate(run_analysis_iter(pdf_path, model=model), start=1):
+            # Find friendly agent name
+            agent_name = next((name for name, lab in steps if lab == label), label)
+            JOBS[job_id]["step"] = idx
+            JOBS[job_id]["message"] = "Running"
+            JOBS[job_id]["current_agent"] = agent_name
+            JOBS[job_id]["current_label"] = label
+            outputs[label] = out
+
+        JOBS[job_id]["step"] = total
         JOBS[job_id]["message"] = "Saving report"
-        out_path = save_report(result, REPORTS_DIR, pdf_path.stem)
+        analysis_result = AnalysisResult(
+            purpose=str(outputs.get("purpose", "")),
+            commercial=str(outputs.get("commercial", "")),
+            legal_risks=str(outputs.get("legal_risks", "")),
+            mitigations=str(outputs.get("mitigations", "")),
+            alert=str(outputs.get("alert", "")),
+            plain=str(outputs.get("plain", "")),
+        )
+        out_path = save_report(analysis_result, REPORTS_DIR, pdf_path.stem)
         name = out_path.name
         url = f"/reports/{name}"
 
@@ -183,28 +210,29 @@ def _run_job(job_id: str, pdf_path: Path):
         mitigations_parsed = None
         alert_parsed = None
         try:
-            commercial_parsed = json.loads(result.commercial)
+            commercial_parsed = json.loads(analysis_result.commercial)
         except Exception:
             pass
         try:
-            legal_risks_parsed = json.loads(result.legal_risks)
+            legal_risks_parsed = json.loads(analysis_result.legal_risks)
             if isinstance(legal_risks_parsed, list):
                 legal_risks_parsed = legal_risks_parsed[:8]
         except Exception:
             pass
         try:
-            mitigations_parsed = json.loads(result.mitigations)
+            mitigations_parsed = json.loads(analysis_result.mitigations)
             if isinstance(mitigations_parsed, list):
                 mitigations_parsed = mitigations_parsed[:8]
         except Exception:
             pass
         try:
-            alert_parsed = json.loads(result.alert)
+            alert_parsed = json.loads(analysis_result.alert)
             exploitative = bool(alert_parsed.get("exploitative"))
             rationale = alert_parsed.get("rationale")
         except Exception:
             pass
 
+        # Reconstruct a result-like object from outputs
         JOBS[job_id]["result"] = AnalyzeResponse(
             report_json_path=str(out_path),
             report_file=name,
@@ -212,18 +240,18 @@ def _run_job(job_id: str, pdf_path: Path):
             exploitative=exploitative,
             rationale=rationale,
             contract_text=load_pdf_text(pdf_path),
-            purpose=result.purpose,
-            commercial=result.commercial,
-            legal_risks=result.legal_risks,
-            mitigations=result.mitigations,
-            alert=result.alert,
-            plain=result.plain,
+            purpose=analysis_result.purpose,
+            commercial=analysis_result.commercial,
+            legal_risks=analysis_result.legal_risks,
+            mitigations=analysis_result.mitigations,
+            alert=analysis_result.alert,
+            plain=analysis_result.plain,
             commercial_parsed=commercial_parsed,
             legal_risks_parsed=legal_risks_parsed,
             mitigations_parsed=mitigations_parsed,
             alert_parsed=alert_parsed,
         )
-        JOBS[job_id]["step"] = 4
+        JOBS[job_id]["step"] = total
         JOBS[job_id]["message"] = "Done"
         JOBS[job_id]["status"] = "done"
     except Exception as e:
@@ -255,6 +283,8 @@ async def analyze_status(job_id: str):
         step=int(job.get("step", 0)),
         total_steps=int(job.get("total_steps", 4)),
         message=job.get("message"),
+        current_agent=job.get("current_agent"),
+        current_label=job.get("current_label"),
         result=job.get("result"),
     )
 
