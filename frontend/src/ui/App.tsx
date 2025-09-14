@@ -79,7 +79,7 @@ export default function App() {
           if (sdata.status === 'error') {
             throw new Error(sdata.message || 'Analysis failed')
           }
-          setTimeout(poll, 900)
+          setTimeout(poll, 1500)
         }
         await poll()
       } else {

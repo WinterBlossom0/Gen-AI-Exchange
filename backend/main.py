@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks
+import logging
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -34,6 +35,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Suppress noisy access logs for status polling
+class _SkipStatusFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        return "/analyze/status" not in msg
+
+logging.getLogger("uvicorn.access").addFilter(_SkipStatusFilter())
 
 load_dotenv()
 
