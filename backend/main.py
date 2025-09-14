@@ -323,6 +323,7 @@ async def analyze_start(background: BackgroundTasks, file: UploadFile = File(...
         "result": None,
         "outputs": {"contract_text": load_pdf_text(pdf_path)},
         "cancelled": False,
+        "pdf_path": str(pdf_path),
     }
     background.add_task(_run_job, job_id, pdf_path)
     return AnalyzeStartResponse(job_id=job_id)
@@ -355,6 +356,26 @@ async def analyze_cancel(job_id: str):
     if job.get("status") not in {"done", "error", "cancelled"}:
         job["status"] = "cancelled"
         job["message"] = "Stopped by user"
+    return {"ok": True}
+
+
+@app.post("/analyze/clear/{job_id}")
+async def analyze_clear(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        return {"ok": True}
+    # Try to remove uploaded file
+    try:
+        p = job.get("pdf_path")
+        if p:
+            Path(p).unlink(missing_ok=True)
+    except Exception:
+        pass
+    # Drop job from memory
+    try:
+        JOBS.pop(job_id, None)
+    except Exception:
+        pass
     return {"ok": True}
 
 

@@ -30,6 +30,16 @@ export default function App() {
   const [reportLoading, setReportLoading] = useState(false)
   const [showContract, setShowContract] = useState(false)
   const [stopping, setStopping] = useState(false)
+  const clearAll = async (jobId?: string) => {
+    if (jobId) {
+      try { await fetch(`${API}/analyze/clear/${jobId}`, { method: 'POST' }) } catch {}
+    }
+    setResult(null)
+    setJob(null)
+    setAnswer('')
+    setQuestion('')
+    try { localStorage.removeItem('job'); localStorage.removeItem('result') } catch {}
+  }
 
   const USE_ASYNC = true
 
@@ -224,6 +234,11 @@ export default function App() {
                   }
                 }} disabled={stopping}>
                   {stopping ? 'Stopping…' : 'Stop'}
+                </button>
+              )}
+              {job.status === 'cancelled' && (
+                <button className="btn" onClick={() => clearAll(job.id)}>
+                  Clear
                 </button>
               )}
             </div>
