@@ -4,9 +4,9 @@ import io
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -44,6 +44,9 @@ REPORTS_DIR.mkdir(exist_ok=True)
 
 # Expose reports directory
 app.mount("/reports", StaticFiles(directory=str(REPORTS_DIR)), name="reports")
+
+# In-memory job store for simple progress tracking
+JOBS: Dict[str, Dict[str, Any]] = {}
 
 
 class AnalyzeResponse(BaseModel):
@@ -138,6 +141,121 @@ async def analyze_contract(file: UploadFile = File(...)):
         legal_risks_parsed=legal_risks_parsed,
         mitigations_parsed=mitigations_parsed,
         alert_parsed=alert_parsed,
+    )
+
+
+class AnalyzeStartResponse(BaseModel):
+    job_id: str
+
+
+class AnalyzeStatusResponse(BaseModel):
+    job_id: str
+    status: str  # pending|running|done|error
+    step: int
+    total_steps: int
+    message: Optional[str] = None
+    result: Optional[AnalyzeResponse] = None
+
+
+def _run_job(job_id: str, pdf_path: Path):
+    try:
+        JOBS[job_id]["status"] = "running"
+        JOBS[job_id]["step"] = 1
+        JOBS[job_id]["message"] = "Reading PDF"
+        _ = load_pdf_text(pdf_path)
+
+        JOBS[job_id]["step"] = 2
+        JOBS[job_id]["message"] = "Analyzing: agents running"
+        model = _resolve_ollama_model()
+        result = run_analysis(pdf_path, model=model)
+
+        JOBS[job_id]["step"] = 3
+        JOBS[job_id]["message"] = "Saving report"
+        out_path = save_report(result, REPORTS_DIR, pdf_path.stem)
+        name = out_path.name
+        url = f"/reports/{name}"
+
+        # Parse fields like in /analyze
+        exploitative = None
+        rationale = None
+        commercial_parsed = None
+        legal_risks_parsed = None
+        mitigations_parsed = None
+        alert_parsed = None
+        try:
+            commercial_parsed = json.loads(result.commercial)
+        except Exception:
+            pass
+        try:
+            legal_risks_parsed = json.loads(result.legal_risks)
+            if isinstance(legal_risks_parsed, list):
+                legal_risks_parsed = legal_risks_parsed[:8]
+        except Exception:
+            pass
+        try:
+            mitigations_parsed = json.loads(result.mitigations)
+            if isinstance(mitigations_parsed, list):
+                mitigations_parsed = mitigations_parsed[:8]
+        except Exception:
+            pass
+        try:
+            alert_parsed = json.loads(result.alert)
+            exploitative = bool(alert_parsed.get("exploitative"))
+            rationale = alert_parsed.get("rationale")
+        except Exception:
+            pass
+
+        JOBS[job_id]["result"] = AnalyzeResponse(
+            report_json_path=str(out_path),
+            report_file=name,
+            report_url=url,
+            exploitative=exploitative,
+            rationale=rationale,
+            contract_text=load_pdf_text(pdf_path),
+            purpose=result.purpose,
+            commercial=result.commercial,
+            legal_risks=result.legal_risks,
+            mitigations=result.mitigations,
+            alert=result.alert,
+            plain=result.plain,
+            commercial_parsed=commercial_parsed,
+            legal_risks_parsed=legal_risks_parsed,
+            mitigations_parsed=mitigations_parsed,
+            alert_parsed=alert_parsed,
+        )
+        JOBS[job_id]["step"] = 4
+        JOBS[job_id]["message"] = "Done"
+        JOBS[job_id]["status"] = "done"
+    except Exception as e:
+        JOBS[job_id]["status"] = "error"
+        JOBS[job_id]["message"] = str(e)
+
+
+@app.post("/analyze/start", response_model=AnalyzeStartResponse)
+async def analyze_start(background: BackgroundTasks, file: UploadFile = File(...)):
+    contents = await file.read()
+    pdf_path = UPLOADS_DIR / file.filename
+    with pdf_path.open("wb") as f:
+        f.write(contents)
+
+    job_id = os.urandom(8).hex()
+    JOBS[job_id] = {"status": "pending", "step": 0, "total_steps": 4, "message": None, "result": None}
+    background.add_task(_run_job, job_id, pdf_path)
+    return AnalyzeStartResponse(job_id=job_id)
+
+
+@app.get("/analyze/status/{job_id}", response_model=AnalyzeStatusResponse)
+async def analyze_status(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        return AnalyzeStatusResponse(job_id=job_id, status="error", step=0, total_steps=4, message="job not found", result=None)
+    return AnalyzeStatusResponse(
+        job_id=job_id,
+        status=job.get("status", "pending"),
+        step=int(job.get("step", 0)),
+        total_steps=int(job.get("total_steps", 4)),
+        message=job.get("message"),
+        result=job.get("result"),
     )
 
 

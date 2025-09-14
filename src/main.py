@@ -113,7 +113,8 @@ def run_analysis(contract_path: Path, model: str | None = None) -> AnalysisResul
 
     # Inject context
     for t in tasks:
-        t.description = t.description.format(contract_text=text)
+        # Avoid str.format because prompts contain JSON braces; do a simple token replace
+        t.description = t.description.replace("{contract_text}", text)
 
     crew = Crew(
         agents=[purpose_agent, commercial_agent, legal_agent, mitig_agent, alert_agent],

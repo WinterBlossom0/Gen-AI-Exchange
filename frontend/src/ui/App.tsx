@@ -8,6 +8,9 @@ export default function App() {
   const [result, setResult] = useState<any>(null)
   const [question, setQuestion] = useState('')
   const [answer, setAnswer] = useState('')
+  const [job, setJob] = useState<{ id: string; status: string; step: number; total: number; message?: string } | null>(null)
+
+  const USE_ASYNC = true
 
   const canAnalyze = useMemo(() => !!file && !loading, [file, loading])
 
@@ -57,9 +60,33 @@ export default function App() {
     try {
       const form = new FormData()
       form.append('file', file)
-      const res = await fetch(`${API}/analyze`, { method: 'POST', body: form })
-      const data = await res.json()
-      setResult(data)
+      if (USE_ASYNC) {
+        // Start job
+        const start = await fetch(`${API}/analyze/start`, { method: 'POST', body: form })
+        const startData = await start.json()
+        if (!start.ok || !startData.job_id) throw new Error('Failed to start analysis')
+        const jobId = startData.job_id as string
+        setJob({ id: jobId, status: 'pending', step: 0, total: 4 })
+        // Poll status
+        const poll = async () => {
+          const st = await fetch(`${API}/analyze/status/${jobId}`)
+          const sdata = await st.json()
+          setJob({ id: jobId, status: sdata.status, step: sdata.step, total: sdata.total_steps, message: sdata.message })
+          if (sdata.status === 'done' && sdata.result) {
+            setResult(sdata.result)
+            return
+          }
+          if (sdata.status === 'error') {
+            throw new Error(sdata.message || 'Analysis failed')
+          }
+          setTimeout(poll, 900)
+        }
+        await poll()
+      } else {
+        const res = await fetch(`${API}/analyze`, { method: 'POST', body: form })
+        const data = await res.json()
+        setResult(data)
+      }
     } catch (e:any) {
       alert('Upload failed. Make sure the backend is running at ' + API + ' and try again.\n' + (e?.message || e))
     } finally {
@@ -105,6 +132,18 @@ export default function App() {
         <input className="input" type="file" accept="application/pdf" onChange={(e: ChangeEvent<HTMLInputElement>) => setFile(e.target.files?.[0] || null)} />
         <button className="btn" onClick={onUpload} disabled={!canAnalyze}>{loading ? 'Analyzing…' : 'Analyze'}</button>
       </div>
+
+      {job && (
+        <div className="card full" style={{marginBottom: 16}}>
+          <div className="row space">
+            <div>Step {job.step} / {job.total}</div>
+            <div className="text small">{job.status.toUpperCase()} {job.message ? `– ${job.message}` : ''}</div>
+          </div>
+          <div className="progress">
+            <div className="bar" style={{width: `${(Math.max(0, Math.min(job.step, job.total)) / job.total) * 100}%`}} />
+          </div>
+        </div>
+      )}
 
       {result && (
         <div className="grid">

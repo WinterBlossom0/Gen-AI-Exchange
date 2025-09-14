@@ -52,3 +52,7 @@ html, body, #root { height: 100%; margin: 0; background: var(--bg); color: var(-
 .pill-good { background: rgba(0, 200, 0, 0.08); }
 .pill-bad { background: rgba(200, 0, 0, 0.12); }
 .row.space { justify-content: space-between; }
+
+/* Progress */
+.progress { background: #0f1430; border: 1px solid #1d2444; border-radius: 6px; height: 10px; margin-top: 8px; overflow: hidden; }
+.progress .bar { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); width: 0%; transition: width 0.4s ease; }
