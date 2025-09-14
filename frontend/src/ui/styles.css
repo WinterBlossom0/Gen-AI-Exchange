@@ -27,3 +27,28 @@ html, body, #root { height: 100%; margin: 0; background: var(--bg); color: var(-
 
 .chat { margin-top: 24px; }
 .pre.answer { background: rgba(124, 252, 0, 0.06); border: 1px solid rgba(124, 252, 0, 0.25); }
+
+/* New UI helpers */
+.bullets { margin: 0; padding-left: 18px; }
+.bullets li { margin: 6px 0; }
+.bullets.compact li { margin: 2px 0; }
+.text { margin: 0; white-space: pre-wrap; }
+.text.small { font-size: 14px; color: var(--muted); }
+.kv { margin: 0; }
+.kv-row { display: grid; grid-template-columns: 190px 1fr; gap: 6px; padding: 6px 0; border-bottom: 1px dashed #263058; }
+.kv-row:last-child { border-bottom: 0; }
+.kv dt { color: var(--muted); text-transform: capitalize; }
+.kv dd { margin: 0; }
+.table-wrap { overflow: auto; }
+.table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.table th, .table td { text-align: left; padding: 8px; border-bottom: 1px solid #1d2444; vertical-align: top; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; border: 1px solid #1d2444; }
+.badge.good { background: rgba(0, 200, 0, 0.08); }
+.badge.bad { background: rgba(200, 0, 0, 0.12); }
+.badge.sev-low { background: rgba(0, 200, 0, 0.08); }
+.badge.sev-medium { background: rgba(255, 165, 0, 0.12); }
+.badge.sev-high { background: rgba(200, 0, 0, 0.12); }
+.pill { display: inline-block; padding: 6px 10px; border-radius: 999px; border: 1px solid #1d2444; }
+.pill-good { background: rgba(0, 200, 0, 0.08); }
+.pill-bad { background: rgba(200, 0, 0, 0.12); }
+.row.space { justify-content: space-between; }

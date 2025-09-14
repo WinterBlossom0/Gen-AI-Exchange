@@ -3,39 +3,38 @@ from __future__ import annotations
 from crewai import Task
 
 PURPOSE_PROMPT = (
-    "You are given a contract. Analyze and summarize: (1) the primary purpose, (2) scope, and (3) key "
-    "deliverables/outcomes. Provide a concise 3-6 sentence summary.\n\nContract:\n{contract_text}"
+    "You are given a contract. In 3-4 short sentences MAX, summarize: (1) primary purpose, (2) scope, (3) key deliverables. "
+    "Be concrete. No fluff, no preambles.\n\nContract:\n{contract_text}"
 )
 
 COMMERCIAL_PROMPT = (
-    "Extract commercial terms and present as JSON with keys: payment_terms, pricing_model, quantities, "
-    "buyer_obligations, supplier_obligations. Quote clause snippets where possible.\n\nContract:\n{contract_text}"
+    "Extract commercial terms as STRICT JSON. Keys: payment_terms, pricing_model, quantities, buyer_obligations, supplier_obligations. "
+    "Each value MUST be short (<= 200 chars). If unknown, use an empty string ''. No extra text.\n\nContract:\n{contract_text}"
 )
 
 LEGAL_RISK_PROMPT = (
-    "Identify legal risks. For each, produce JSON with fields: clause, risk, fairness (fair/unfair), "
-    "favours (buyer/supplier/equal), severity (low/medium/high).\n\nContract:\n{contract_text}"
+    "Identify top legal risks (max 8). Output STRICT JSON array. Each item: {clause: string<=180, risk: string<=180, fairness: fair|unfair, favours: buyer|supplier|equal, severity: low|medium|high}. "
+    "No extra commentary.\n\nContract:\n{contract_text}"
 )
 
 MITIGATION_PROMPT = (
-    "Given the identified legal risks, propose concrete mitigations. For each risk, output JSON with: "
-    "clause, mitigation, negotiation_points, references (if any).\n\nContract:\n{contract_text}"
+    "Propose mitigations for the key risks (align order with risks). Output STRICT JSON array, items: {clause: string<=120, mitigation: string<=180, negotiation_points: string<=180}. "
+    "Be specific and concise.\n\nContract:\n{contract_text}"
 )
 
 ALERT_PROMPT = (
     "Decide if the contract is exploitative overall. Consider count and severity of 'unfair' risks. "
-    "Return JSON with: exploitative (true/false), rationale, top_unfair_clauses (array).\n\nContract:\n{contract_text}"
+    "Return STRICT JSON: {exploitative: true|false, rationale: string<=240, top_unfair_clauses: string[]}\n\nContract:\n{contract_text}"
 )
 
 SIMPLIFIER_PROMPT = (
-    "Rewrite the contract in plain language for non-lawyers. Use short bullets and simple sentences. "
-    "Include: purpose, key duties for both parties, payment terms, timelines, risks (who they favor), and what to watch out for.\n\n"
-    "Contract:\n{contract_text}"
+    "Rewrite in plain language for non-lawyers. MAX 8 bullets, each <= 140 chars. Focus on: purpose, duties (both sides), payments, timelines, risks (who they favor), watch-outs. "
+    "No intro or outro.\n\nContract:\n{contract_text}"
 )
 
 CHAT_PROMPT = (
-    "You will answer questions about the contract. Base answers strictly on the contract and the analysis.\n\n"
-    "Contract:\n{contract_text}\n\nAnalysis:\n{analysis}\n\nQuestion:\n{question}"
+    "Answer the question based ONLY on the contract and analysis. 3-6 concise sentences. Start with the direct answer; include clause refs in parentheses. "
+    "Avoid restating the whole contract.\n\nContract:\n{contract_text}\n\nAnalysis:\n{analysis}\n\nQuestion:\n{question}"
 )
 
 
@@ -44,23 +43,23 @@ def purpose_task(agent) -> Task:
 
 
 def commercial_task(agent) -> Task:
-    return Task(description=COMMERCIAL_PROMPT, agent=agent, expected_output="JSON with commercial terms")
+    return Task(description=COMMERCIAL_PROMPT, agent=agent, expected_output="Strict JSON object for commercial terms")
 
 
 def legal_risk_task(agent) -> Task:
-    return Task(description=LEGAL_RISK_PROMPT, agent=agent, expected_output="JSON list of risks")
+    return Task(description=LEGAL_RISK_PROMPT, agent=agent, expected_output="Strict JSON array of risks (<=8)")
 
 
 def mitigation_task(agent) -> Task:
-    return Task(description=MITIGATION_PROMPT, agent=agent, expected_output="JSON mitigations per risk")
+    return Task(description=MITIGATION_PROMPT, agent=agent, expected_output="Strict JSON array of mitigations")
 
 
 def alert_task(agent) -> Task:
-    return Task(description=ALERT_PROMPT, agent=agent, expected_output="JSON exploitative decision")
+    return Task(description=ALERT_PROMPT, agent=agent, expected_output="Strict JSON decision object")
 
 
 def simplifier_task(agent) -> Task:
-    return Task(description=SIMPLIFIER_PROMPT, agent=agent, expected_output="Plain-language summary")
+    return Task(description=SIMPLIFIER_PROMPT, agent=agent, expected_output="Max 8 short bullets")
 
 
 def chat_task(agent, contract_text: str, analysis: str, question: str) -> Task:

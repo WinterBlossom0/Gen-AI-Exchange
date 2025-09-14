@@ -60,6 +60,11 @@ class AnalyzeResponse(BaseModel):
     mitigations: str
     alert: str
     plain: str
+    # Parsed fields for cleaner UI when possible
+    commercial_parsed: Optional[dict] = None
+    legal_risks_parsed: Optional[list] = None
+    mitigations_parsed: Optional[list] = None
+    alert_parsed: Optional[dict] = None
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -81,15 +86,37 @@ async def analyze_contract(file: UploadFile = File(...)):
     name = out_path.name
     url = f"/reports/{name}"
 
-    # Parse alert
+    # Parse and lightly post-process outputs for UI
     exploitative = None
     rationale = None
+    commercial_parsed = None
+    legal_risks_parsed = None
+    mitigations_parsed = None
+    alert_parsed = None
     try:
-        data = json.loads(result.alert)
-        exploitative = bool(data.get("exploitative"))
-        rationale = data.get("rationale")
+        # Commercial
+        commercial_parsed = json.loads(result.commercial)
     except Exception:
-        pass
+        commercial_parsed = None
+    try:
+        # Risks (cap count for UI)
+        legal_risks_parsed = json.loads(result.legal_risks)
+        if isinstance(legal_risks_parsed, list):
+            legal_risks_parsed = legal_risks_parsed[:8]
+    except Exception:
+        legal_risks_parsed = None
+    try:
+        mitigations_parsed = json.loads(result.mitigations)
+        if isinstance(mitigations_parsed, list):
+            mitigations_parsed = mitigations_parsed[:8]
+    except Exception:
+        mitigations_parsed = None
+    try:
+        alert_parsed = json.loads(result.alert)
+        exploitative = bool(alert_parsed.get("exploitative"))
+        rationale = alert_parsed.get("rationale")
+    except Exception:
+        alert_parsed = None
 
     # Optional email alert
     maybe_send_alert(result.alert, pdf_path.name)
@@ -107,6 +134,10 @@ async def analyze_contract(file: UploadFile = File(...)):
         mitigations=result.mitigations,
         alert=result.alert,
         plain=result.plain,
+        commercial_parsed=commercial_parsed,
+        legal_risks_parsed=legal_risks_parsed,
+        mitigations_parsed=mitigations_parsed,
+        alert_parsed=alert_parsed,
     )
 
 

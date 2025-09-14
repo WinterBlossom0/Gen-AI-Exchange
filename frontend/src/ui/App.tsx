@@ -11,6 +11,45 @@ export default function App() {
 
   const canAnalyze = useMemo(() => !!file && !loading, [file, loading])
 
+  const safeParseJson = <T,>(val: any): T | null => {
+    if (!val || typeof val !== 'string') return null
+    try {
+      return JSON.parse(val) as T
+    } catch {
+      return null
+    }
+  }
+
+  const parsed = useMemo(() => {
+    if (!result) return { commercial: null, risks: null, mitigations: null, alert: null }
+    // Prefer backend-parsed fields, fallback to local parse
+    const commercial = result.commercial_parsed ?? safeParseJson<Record<string, string>>(result.commercial)
+    const risks = result.legal_risks_parsed ?? safeParseJson<Array<{ clause: string; risk: string; fairness: string; favours: string; severity: string }>>(result.legal_risks)
+    const mitigations = result.mitigations_parsed ?? safeParseJson<Array<{ clause: string; mitigation: string; negotiation_points?: string }>>(result.mitigations)
+    const alert = result.alert_parsed ?? safeParseJson<{ exploitative: boolean; rationale?: string; top_unfair_clauses?: string[] }>(result.alert)
+    return { commercial, risks, mitigations, alert }
+  }, [result])
+
+  const bulletLines = (text: string): string[] => {
+    if (!text) return []
+    const lines = text
+      .split(/\r?\n/)
+      .map(l => l.trim())
+      .filter(Boolean)
+    // If lines look like bullets already, keep them; otherwise, take first 8 sentences-like chunks
+    if (lines.some(l => /^[-*•]/.test(l))) {
+      return lines.map(l => l.replace(/^[-*•]\s*/, '')).slice(0, 8)
+    }
+    const chunks = text.split(/[\n\r]+|(?<=[.!?])\s+/).map(s => s.trim()).filter(Boolean)
+    return chunks.slice(0, 8)
+  }
+
+  const limitText = (text: string, max = 360): string => {
+    if (!text) return ''
+    if (text.length <= max) return text
+    return text.slice(0, max - 1).trimEnd() + '…'
+  }
+
   const onUpload = async () => {
     if (!file) return
     setLoading(true)
@@ -71,27 +110,110 @@ export default function App() {
         <div className="grid">
           <section className="card full">
             <h2>In simple terms</h2>
-            <pre className="pre">{result.plain}</pre>
+            <ul className="bullets">
+              {bulletLines(result.plain).map((b, i) => (
+                <li key={i}>{b}</li>
+              ))}
+            </ul>
           </section>
           <section className="card">
             <h3>Purpose</h3>
-            <pre className="pre">{result.purpose}</pre>
+            <p className="text">{limitText(result.purpose)}</p>
           </section>
           <section className="card">
             <h3>Commercial</h3>
-            <pre className="pre">{result.commercial}</pre>
+            {parsed.commercial ? (
+              <dl className="kv">
+                {Object.entries(parsed.commercial).map(([k, v]) => (
+                  <div className="kv-row" key={k}>
+                    <dt>{k.replace(/_/g, ' ')}</dt>
+                    <dd>{String((v as unknown) ?? '—')}</dd>
+                  </div>
+                ))}
+              </dl>
+            ) : (
+              <pre className="pre">{result.commercial}</pre>
+            )}
           </section>
           <section className="card">
             <h3>Legal Risks</h3>
-            <pre className="pre">{result.legal_risks}</pre>
+            {Array.isArray(parsed.risks) ? (
+              <div className="table-wrap">
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>Clause</th>
+                      <th>Risk</th>
+                      <th>Fairness</th>
+                      <th>Favours</th>
+                      <th>Severity</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {parsed.risks.map((r, idx) => (
+                      <tr key={idx}>
+                        <td>{r.clause}</td>
+                        <td>{r.risk}</td>
+                        <td><span className={`badge ${r.fairness === 'unfair' ? 'bad' : 'good'}`}>{r.fairness}</span></td>
+                        <td>{r.favours}</td>
+                        <td><span className={`badge sev-${(r.severity||'').toLowerCase()}`}>{r.severity}</span></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <pre className="pre">{result.legal_risks}</pre>
+            )}
           </section>
           <section className="card">
             <h3>Mitigations</h3>
-            <pre className="pre">{result.mitigations}</pre>
+            {Array.isArray(parsed.mitigations) ? (
+              <div className="table-wrap">
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>Clause</th>
+                      <th>Mitigation</th>
+                      <th>Negotiation Points</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {parsed.mitigations.map((m, idx) => (
+                      <tr key={idx}>
+                        <td>{m.clause}</td>
+                        <td>{m.mitigation}</td>
+                        <td>{m.negotiation_points || '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <pre className="pre">{result.mitigations}</pre>
+            )}
           </section>
           <section className="card">
             <h3>Exploitative?</h3>
-            <pre className="pre">{result.alert}</pre>
+            {parsed.alert ? (
+              <div>
+                <div className="row space">
+                  <span className={`pill ${parsed.alert.exploitative ? 'pill-bad' : 'pill-good'}`}>
+                    {parsed.alert.exploitative ? 'Exploitative' : 'Not exploitative'}
+                  </span>
+                </div>
+                {parsed.alert.rationale && <p className="text small">{parsed.alert.rationale}</p>}
+                {parsed.alert.top_unfair_clauses?.length ? (
+                  <ul className="bullets compact">
+                    {parsed.alert.top_unfair_clauses.slice(0, 5).map((c: string, i: number) => (
+                      <li key={i}>{c}</li>
+                    ))}
+                  </ul>
+                ) : null}
+              </div>
+            ) : (
+              <pre className="pre">{result.alert}</pre>
+            )}
           </section>
           {result.report_url && (
             <section className="card full">
