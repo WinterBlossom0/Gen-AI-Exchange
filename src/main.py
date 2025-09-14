@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Callable, Optional
 
 from crewai import Crew, Process, Task
 from dotenv import load_dotenv
@@ -139,7 +139,7 @@ def build_agents_and_tasks(contract_text: str, model: str | None = None):
     return agents, tasks, labels
 
 
-def run_analysis_iter(contract_path: Path, model: str | None = None):
+def run_analysis_iter(contract_path: Path, model: str | None = None, on_partial: Optional[Callable[[str, Dict[str, Any]], None]] = None):
     """Yield (label, output_string) per task sequentially to support progress reporting.
     Heavy tasks (legal_risks, mitigations) are chunked and can run partially in parallel.
     The alert decision is derived from merged risks to avoid long calls.
@@ -297,6 +297,7 @@ def run_analysis_iter(contract_path: Path, model: str | None = None):
                 return t
 
             results = []
+            merged_items: list[dict] = []
             # Parallel execution of chunk tasks
             with ThreadPoolExecutor(max_workers=PAR) as ex:
                 fut_map = {ex.submit(_run_single, None, build_chunk_task(c)): idx for idx, c in enumerate(chunks)}
@@ -306,7 +307,19 @@ def run_analysis_iter(contract_path: Path, model: str | None = None):
                     except Exception:
                         results.append("[]")
 
-            # Merge arrays
+                    # Update partials incrementally with merged arrays so far
+                    merged_items = []
+                    for r in results:
+                        merged_items.extend(_safe_json_list(str(r)))
+                    if on_partial:
+                        if label == "legal_risks":
+                            cur = _merge_risks(merged_items)
+                            on_partial(label, {"legal_risks_parsed": cur[:8]})
+                        else:
+                            # For mitigations we can't fully align until risks ready; still stream best-effort
+                            on_partial(label, {"mitigations_parsed": merged_items[:8]})
+
+            # Merge arrays after all chunks complete
             merged_items = []
             for r in results:
                 merged_items.extend(_safe_json_list(str(r)))
@@ -369,6 +382,7 @@ def run_analysis_iter(contract_path: Path, model: str | None = None):
                 return a, t
 
             partials: list[str] = []
+            merged_commercial: Dict[str, Any] = {}
             with ThreadPoolExecutor(max_workers=PAR) as ex:
                 fut_map = {}
                 for c in chunks:
@@ -379,6 +393,28 @@ def run_analysis_iter(contract_path: Path, model: str | None = None):
                         partials.append(fut.result())
                     except Exception:
                         partials.append("")
+
+                    # Stream partials as they arrive
+                    if on_partial:
+                        if label == "commercial":
+                            # Incrementally merge JSON objects
+                            obj = {}
+                            try:
+                                obj = json.loads(partials[-1])
+                            except Exception:
+                                from src.utils.json_sanitizer import extract_json_object
+                                obj = extract_json_object(str(partials[-1])) or {}
+                            if isinstance(obj, dict):
+                                for k, v in obj.items():
+                                    if v and k not in merged_commercial:
+                                        merged_commercial[k] = v
+                            on_partial(label, {"commercial_parsed": merged_commercial})
+                        else:
+                            # For purpose/plain, stream a quick combined snippet (first 150 words)
+                            text_so_far = "\n".join([p for p in partials if isinstance(p, str)])
+                            words = text_so_far.split()
+                            snippet = " ".join(words[:150])
+                            on_partial(label, {label: snippet})
 
             if label == "commercial":
                 # Merge commercial JSON objects over chunks

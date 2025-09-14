@@ -3,45 +3,44 @@ from __future__ import annotations
 from crewai import Task
 
 PURPOSE_PROMPT = (
-    "You are given a contract. In 2-3 short sentences MAX, summarize: (1) primary purpose, (2) scope, (3) key deliverables. "
-    "Be concrete. No fluff, no preambles. <= 80 words total.\n\nContract:\n{contract_text}"
+    "Summarize the contract for a busy reader in 2–3 short sentences: what it’s for, the scope, and the main deliverables. "
+    "Be direct and concrete. Keep it under 80 words.\n\nContract:\n{contract_text}"
 )
 
 COMMERCIAL_PROMPT = (
-    "Extract commercial terms as STRICT JSON. Keys: payment_terms, pricing_model, quantities, buyer_obligations, supplier_obligations. "
-    "Each value MUST be short (<= 200 chars). If unknown, use an empty string ''. No extra text.\n\nContract:\n{contract_text}"
+    "List the core commercial terms as a compact JSON object with these keys: payment_terms, pricing_model, quantities, buyer_obligations, supplier_obligations. "
+    "Keep values brief (≤200 chars). If something isn’t stated, use an empty string ''. Reply with JSON only—no extra words.\n\nContract:\n{contract_text}"
 )
 
 LEGAL_RISK_PROMPT = (
-    "Identify top legal risks (max 8). Output STRICT JSON array. Each item: {clause: string<=180, risk: string<=180, fairness: fair|unfair, favours: buyer|supplier|equal, severity: low|medium|high}. "
-    "No extra commentary.\n\nContract:\n{contract_text}"
+    "Identify up to 8 important legal risks. Return a JSON array only. Each item: {clause: string≤180, risk: string≤180, fairness: fair|unfair, favours: buyer|supplier|equal, severity: low|medium|high}.\n\n"
+    "Contract:\n{contract_text}"
 )
 
 MITIGATION_PROMPT = (
-    "Propose mitigations for the key risks (align order with risks). Output STRICT JSON array, items: {clause: string<=120, mitigation: string<=180, negotiation_points: string<=180}. "
-    "Be specific and concise.\n\nContract:\n{contract_text}"
+    "Suggest practical mitigations matching the key risks (same order). Return JSON array only. Each item: {clause: string≤120, mitigation: string≤180, negotiation_points: string≤180}.\n\n"
+    "Contract:\n{contract_text}"
 )
 
 ALERT_PROMPT = (
-    "Decide if the contract is exploitative overall. Consider count and severity of 'unfair' risks. "
-    "Return STRICT JSON: {exploitative: true|false, rationale: string<=240, top_unfair_clauses: string[]}\n\nContract:\n{contract_text}"
+    "Based on the risk profile, decide if this contract is exploitative overall. Keep the reasoning short. "
+    "Return JSON only: {exploitative: true|false, rationale: string≤240, top_unfair_clauses: string[]}\n\nContract:\n{contract_text}"
 )
 
 SIMPLIFIER_PROMPT = (
-    "Explain the contract so someone with very low literacy can understand without losing legal nuance. "
-    "Use very simple words and short phrases. Avoid legal jargon; if a legal term must appear, explain it in brackets, e.g., indemnity (who pays for harm). "
-    "OUTPUT: 8-10 bullets, each <= 140 chars. Start bullets with You:, They:, or Both: for clarity. "
-    "Cover, if present: purpose; who does what; money (how much, when); time limits; changes/scope; IP ownership; secrets (confidentiality); damage limits (caps); who pays if things go wrong (indemnity); ending early (termination); which law/court; penalties/late fees; data privacy; warranties; acceptance/tests. "
-    "End with 1-2 bullets of Watch out: biggest risks to you. No intro or outro.\n\nContract:\n{contract_text}"
+    "Explain this contract so anyone can understand it without losing key legal meaning. "
+    "Use very simple words and short lines. If a legal term appears, add a plain meaning in brackets (e.g., indemnity [who pays for harm]). "
+    "Write 8–10 bullets, each ≤140 characters. Start lines with You:, They:, or Both:. Include things like purpose, duties, money, deadlines, changes, IP, confidentiality, limits on damages, indemnity, termination, law/court, late fees, privacy, warranties, acceptance/tests. "
+    "Finish with 1–2 Watch out: lines for the biggest risks. No intro/outro.\n\nContract:\n{contract_text}"
 )
 
 CHAT_PROMPT = (
-    "Answer ONLY the user question using the contract and analysis. Do not invent facts. If not stated, say 'Not stated in the contract.' "
-    "Format: \n"
-    "- First line: Direct answer (<= 20 words). If yes/no, start with Yes. or No.\n"
-    "- Second line: Brief reason with clause reference(s) in parentheses, e.g., (Clause 5, Termination).\n"
-    "- If the question has parts, label A), B).\n"
-    "Keep total under 100 words.\n\nContract:\n{contract_text}\n\nAnalysis:\n{analysis}\n\nQuestion:\n{question}"
+    "Answer the question strictly from the contract. If something isn’t stated, say: Not stated in the contract.\n"
+    "Format:\n"
+    "- Direct answer first (≤20 words). If yes/no, start with Yes. or No.\n"
+    "- Then a short reason with clause ref(s) in parentheses, e.g., (Clause 5, Termination).\n"
+    "- If multiple parts, label A), B). Keep total under 100 words.\n\n"
+    "Contract:\n{contract_text}\n\nAnalysis:\n{analysis}\n\nQuestion:\n{question}"
 )
 
 

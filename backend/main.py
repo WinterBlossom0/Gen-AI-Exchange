@@ -187,7 +187,12 @@ def _run_job(job_id: str, pdf_path: Path):
         JOBS[job_id]["total_steps"] = total
 
         # Iterate tasks sequentially and update status
-        for idx, (label, out) in enumerate(run_analysis_iter(pdf_path, model=model), start=1):
+        def _on_partial(part_label: str, data: Dict[str, Any]):
+            cur = JOBS[job_id].get("outputs") or {}
+            cur.update(data)
+            JOBS[job_id]["outputs"] = cur
+
+        for idx, (label, out) in enumerate(run_analysis_iter(pdf_path, model=model, on_partial=_on_partial), start=1):
             # Find friendly agent name
             agent_name = next((name for name, lab in steps if lab == label), label)
             JOBS[job_id]["step"] = idx
