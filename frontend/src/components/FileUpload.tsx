@@ -5,9 +5,11 @@ interface FileUploadProps {
   onFileSelect: (file: File | null) => void
   onAnalyze: () => void
   isLoading: boolean
+  recipientEmail: string
+  onRecipientChange: (email: string) => void
 }
 
-export default function FileUpload({ file, onFileSelect, onAnalyze, isLoading }: FileUploadProps) {
+export default function FileUpload({ file, onFileSelect, onAnalyze, isLoading, recipientEmail, onRecipientChange }: FileUploadProps) {
   return (
     <section className="file-upload-section">
       <div className="upload-icon" aria-hidden>📄</div>
@@ -25,6 +27,18 @@ export default function FileUpload({ file, onFileSelect, onAnalyze, isLoading }:
         <label htmlFor="file-upload" className="btn btn-outline">
           Choose PDF File
         </label>
+      </div>
+
+      <div className="input-group" style={{ marginTop: 12 }}>
+        <label htmlFor="recipient-email" className="input-label">Recipient email (optional)</label>
+        <input
+          id="recipient-email"
+          type="email"
+          placeholder="alerts@yourdomain.com"
+          value={recipientEmail}
+          onChange={(e) => onRecipientChange(e.target.value)}
+          className="text-input"
+        />
       </div>
 
       {file && (

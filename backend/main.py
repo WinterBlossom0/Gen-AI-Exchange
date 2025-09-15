@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -16,8 +16,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.main import run_analysis, run_analysis_iter, save_report, maybe_send_alert, _resolve_model as _resolve_ollama_model, AnalysisResult  # type: ignore
+from src.main import run_analysis, run_analysis_iter, save_report, maybe_send_alert, _resolve_model as _resolve_ollama_model, AnalysisResult, build_agents_and_tasks  # type: ignore
 from src.utils.pdf_loader import load_pdf_text  # type: ignore
+from src.utils.emailer import load_smtp_config, send_email  # type: ignore
 
 app = FastAPI(title="Contract Analyzer API")
 DEV_ORIGINS = [
@@ -46,6 +47,7 @@ REPORTS_DIR.mkdir(exist_ok=True)
 app.mount("/reports", StaticFiles(directory=str(REPORTS_DIR)), name="reports")
 
 JOBS: Dict[str, Dict[str, Any]] = {}
+FILES: Dict[str, Dict[str, Any]] = {}
 
 
 class AnalyzeResponse(BaseModel):
@@ -66,6 +68,60 @@ class AnalyzeResponse(BaseModel):
     plain: str
     # Raw agent outputs for transparency/debugging
     debug_raw: Optional[Dict[str, Any]] = None
+
+
+class UploadResponse(BaseModel):
+    file_id: str
+    file_name: str
+    contract_text: str
+
+
+class SectionRequest(BaseModel):
+    file_id: str
+    label: str  # one of: purpose|commercial|legal_risks|mitigations|alert
+    recipient: Optional[str] = None
+
+
+class SectionResponse(BaseModel):
+    label: str
+    output: str
+
+
+class FinalizeRequest(BaseModel):
+    file_id: str
+    purpose: str
+    commercial: str
+    legal_risks: str
+    mitigations: str
+    alert: str
+    plain: Optional[str] = None
+
+
+class FinalizeResponse(BaseModel):
+    report_json_path: str
+    report_file: str
+    report_url: str
+    raw_report_url: str
+    raw_text_url: str
+    contract_text: str
+
+
+class TestEmailRequest(BaseModel):
+    to: Optional[str] = None
+    include_pdf: bool = False
+
+
+class TestEmailResponse(BaseModel):
+    ok: bool
+    message: str
+
+
+class EmailConfigResponse(BaseModel):
+    host_set: bool
+    port: int
+    username_set: bool
+    use_tls: bool
+    from_addr_set: bool
 
 @app.get("/api/reports/list")
 def api_list_reports():
@@ -125,8 +181,152 @@ def health():
     return {"status": "ok"}
 
 
+@app.post("/upload", response_model=UploadResponse)
+async def upload_contract(file: UploadFile = File(...)):
+    contents = await file.read()
+    pdf_path = UPLOADS_DIR / file.filename
+    with pdf_path.open("wb") as f:
+        f.write(contents)
+    file_id = os.urandom(8).hex()
+    FILES[file_id] = {"path": str(pdf_path), "name": file.filename}
+    return UploadResponse(file_id=file_id, file_name=file.filename, contract_text=load_pdf_text(pdf_path))
+
+
+@app.post("/analyze/section", response_model=SectionResponse)
+async def analyze_section(req: SectionRequest):
+    # Validate
+    info = FILES.get(req.file_id)
+    if not info:
+        return SectionResponse(label=req.label, output="")
+    pdf_path = Path(info["path"])
+    if not pdf_path.exists():
+        return SectionResponse(label=req.label, output="")
+
+    # Build single agent+task for the given label
+    model = _resolve_ollama_model()
+    text = load_pdf_text(pdf_path)
+    agents, tasks, labels = build_agents_and_tasks(text, model)
+    if req.label not in labels:
+        return SectionResponse(label=req.label, output="")
+    idx = labels.index(req.label)
+
+    from crewai import Crew, Process  # type: ignore
+    agent = agents[idx]
+    task = tasks[idx]
+    crew = Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False)
+    _ = crew.kickoff()
+    try:
+        raw = task.output.raw if hasattr(task, "output") else str(task.output)
+    except Exception:
+        raw = ""
+
+    # Optional email on alert
+    if req.label == "alert":
+        try:
+            maybe_send_alert(raw, pdf_path.name, pdf_path=pdf_path, recipient_override=req.recipient)
+        except Exception:
+            pass
+
+    return SectionResponse(label=req.label, output=str(raw or ""))
+
+
+@app.post("/analyze/finalize", response_model=FinalizeResponse)
+async def analyze_finalize(req: FinalizeRequest):
+    info = FILES.get(req.file_id)
+    if not info:
+        return {"error": "file not found"}  # type: ignore
+    pdf_path = Path(info["path"])
+    model = _resolve_ollama_model()
+    # Build a result object and persist
+    result = AnalysisResult(
+        purpose=req.purpose,
+        commercial=req.commercial,
+        legal_risks=req.legal_risks,
+        mitigations=req.mitigations,
+        alert=req.alert,
+        plain=req.plain or "",
+    )
+    raw_payload = {
+        "purpose": req.purpose,
+        "commercial": req.commercial,
+        "legal_risks": req.legal_risks,
+        "mitigations": req.mitigations,
+        "alert": req.alert,
+        "plain": req.plain or "",
+    }
+    out_path = save_report(result, REPORTS_DIR, pdf_path.stem, model=model, raw=raw_payload)
+    name = out_path.name
+    url = f"/reports/{name}"
+    raw_name = name.replace("_analysis.json", "_raw.json")
+    raw_url = f"/reports/{raw_name}"
+    raw_txt = name.replace("_analysis.json", "_raw.txt")
+    raw_txt_url = f"/reports/{raw_txt}"
+
+    return FinalizeResponse(
+        report_json_path=str(out_path),
+        report_file=name,
+        report_url=url,
+        raw_report_url=raw_url,
+        raw_text_url=raw_txt_url,
+        contract_text=load_pdf_text(pdf_path),
+    )
+
+
+@app.post("/upload/clear/{file_id}")
+async def upload_clear(file_id: str):
+    info = FILES.pop(file_id, None)
+    if not info:
+        return {"ok": True}
+    try:
+        p = Path(info.get("path", ""))
+        if p.exists():
+            p.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+@app.get("/email/config", response_model=EmailConfigResponse)
+async def email_config():
+    try:
+        cfg = load_smtp_config()
+        return EmailConfigResponse(
+            host_set=bool(cfg.host),
+            port=int(cfg.port or 0),
+            username_set=bool(cfg.username),
+            use_tls=bool(cfg.use_tls),
+            from_addr_set=bool(cfg.from_addr or cfg.username)
+        )
+    except Exception:
+        # Report "not set" without leaking details
+        return EmailConfigResponse(host_set=False, port=0, username_set=False, use_tls=True, from_addr_set=False)
+
+
+@app.post("/email/test", response_model=TestEmailResponse)
+async def email_test(req: TestEmailRequest):
+    try:
+        cfg = load_smtp_config()
+    except Exception as e:
+        return TestEmailResponse(ok=False, message=f"SMTP config error: {e}")
+
+    to_addr = req.to or os.getenv("ALERT_TO_EMAIL") or cfg.from_addr or cfg.username
+    if not to_addr:
+        return TestEmailResponse(ok=False, message="No recipient. Provide 'to' or set ALERT_TO_EMAIL/ALERT_FROM_EMAIL.")
+    try:
+        attachments = []
+        if req.include_pdf:
+            # Try attach any last uploaded file if available
+            last = next(iter(FILES.values()), None)
+            if last and last.get("path"):
+                attachments = [last["path"]]
+        send_email(to_addr, "Contract Analyzer SMTP Test", "This is a test email from the Contract Analyzer backend.", attachments=attachments)
+        return TestEmailResponse(ok=True, message=f"Sent to {to_addr}")
+    except Exception as e:
+        return TestEmailResponse(ok=False, message=f"Send failed: {e}")
+
+
 @app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze_contract(file: UploadFile = File(...)):
+async def analyze_contract(file: UploadFile = File(...), recipient: Optional[str] = Form(default=None)):
     # Save uploaded file
     contents = await file.read()
     pdf_path = UPLOADS_DIR / file.filename
@@ -159,7 +359,11 @@ async def analyze_contract(file: UploadFile = File(...)):
     purpose_text = result.purpose
 
     # Optional email alert
-    maybe_send_alert(result.alert, pdf_path.name)
+    # Optional email alert with attachment and recipient override
+    try:
+        maybe_send_alert(result.alert, pdf_path.name, pdf_path=pdf_path, recipient_override=recipient)
+    except Exception:
+        pass
 
     # Build final plain: sanitize formatting + remove potential internal thought lines
     final_plain = _sanitize_no_thought(_sanitize_plain(result.plain))
@@ -352,6 +556,13 @@ def _run_job(job_id: str, pdf_path: Path):
             job["step"] = total
             job["message"] = "Done"
             job["status"] = "done"
+
+        # Send alert email with attachment if exploitative and recipient available
+        try:
+            recipient = (JOBS.get(job_id) or {}).get("recipient")
+            maybe_send_alert(analysis_result.alert, pdf_path.name, pdf_path=pdf_path, recipient_override=recipient)
+        except Exception:
+            pass
     except Exception as e:
         tb = traceback.format_exc()
         job = JOBS.get(job_id)
@@ -361,7 +572,7 @@ def _run_job(job_id: str, pdf_path: Path):
 
 
 @app.post("/analyze/start", response_model=AnalyzeStartResponse)
-async def analyze_start(background: BackgroundTasks, file: UploadFile = File(...)):
+async def analyze_start(background: BackgroundTasks, file: UploadFile = File(...), recipient: Optional[str] = Form(default=None)):
     contents = await file.read()
     pdf_path = UPLOADS_DIR / file.filename
     with pdf_path.open("wb") as f:
@@ -383,6 +594,8 @@ async def analyze_start(background: BackgroundTasks, file: UploadFile = File(...
         "cancelled": False,
         "pdf_path": str(pdf_path),
     }
+    # Store recipient override in job context for later email sending
+    JOBS[job_id]["recipient"] = recipient
     background.add_task(_run_job, job_id, pdf_path)
     return AnalyzeStartResponse(job_id=job_id)
 

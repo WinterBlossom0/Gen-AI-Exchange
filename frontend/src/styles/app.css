@@ -250,6 +250,49 @@ body {
   border-radius: var(--radius-md);
 }
 
+/* Recipient input styling */
+.input-group {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--spacing-2);
+  margin: var(--spacing-4) auto 0;
+  width: 100%;
+  max-width: 520px;
+}
+
+.input-label {
+  align-self: flex-start;
+  color: var(--text-secondary);
+  font-weight: 600;
+  font-size: var(--font-size-sm);
+}
+
+.text-input {
+  width: 100%;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 2px solid var(--border-light);
+  border-radius: var(--radius-lg);
+  padding: var(--spacing-4) var(--spacing-5);
+  outline: none;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.1s ease;
+  box-shadow: var(--shadow-sm);
+}
+
+.text-input::placeholder {
+  color: var(--text-muted);
+}
+
+.text-input:focus {
+  border-color: var(--primary);
+  box-shadow: var(--glow-primary);
+}
+
+.text-input:hover {
+  transform: translateY(-1px);
+}
+
 /* Progress Tracker */
 .progress-tracker {
   background: var(--bg-card);

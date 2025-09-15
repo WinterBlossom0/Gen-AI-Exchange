@@ -24,7 +24,8 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState<any>(null)
   const [job, setJob] = useState<JobState | null>(null)
-  const abortPollRef = useRef(false)
+  const [recipientEmail, setRecipientEmail] = useState<string>("")
+  const abortRef = useRef(false)
   // Removed Load Existing Reports feature; no listing/persistence of past reports
 
   // Restore state on load
@@ -65,14 +66,10 @@ export default function App() {
   }, [result])
 
   const clearAll = async () => {
-    abortPollRef.current = true
-    
+    abortRef.current = true
+    // Clear uploaded file if using new multi-call flow (job.id as file_id)
     if (job?.id) {
-      try {
-        await fetch(`${API}/analyze/clear/${job.id}`, { method: 'POST' })
-      } catch (error) {
-        console.warn('Failed to clear job:', error)
-      }
+      try { await fetch(`${API}/upload/clear/${job.id}`, { method: 'POST' }) } catch {}
     }
 
     setFile(null)
@@ -99,136 +96,76 @@ export default function App() {
     if (!file) return
 
     setLoading(true)
-    abortPollRef.current = false
+  abortRef.current = false
     setResult(null)
 
     try {
-      const formData = new FormData()
-      formData.append('file', file)
+      // Upload first
+      const upload = new FormData()
+      upload.append('file', file)
+      const up = await fetch(`${API}/upload`, { method: 'POST', body: upload })
+      if (!up.ok) throw new Error('Upload failed')
+      const upJson = await up.json()
+      const fileId: string = upJson.file_id
+      const contractText: string = upJson.contract_text
+      setJob({ id: fileId, status: 'running', step: 0, total: 6 })
 
-      const response = await fetch(`${API}/analyze/start`, {
-        method: 'POST',
-        body: formData
-      })
-
-      if (!response.ok) {
-        throw new Error('Failed to start analysis')
+      const labels = ['purpose','commercial','legal_risks','mitigations','alert'] as const
+      const outputs: Record<string, string> = {}
+      for (let i = 0; i < labels.length; i++) {
+        if (abortRef.current) throw new Error('Cancelled')
+        const label = labels[i]
+        const payload: any = { file_id: fileId, label }
+        if (label === 'alert' && recipientEmail) payload.recipient = recipientEmail
+        const res = await fetch(`${API}/analyze/section`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+        if (!res.ok) throw new Error(`Section ${label} failed`)
+        const data = await res.json()
+        outputs[label] = data.output || ''
+        setJob({ id: fileId, status: 'running', step: i + 1, total: 6, label })
       }
 
-      const { job_id } = await response.json()
-      setJob({
-        id: job_id,
-        status: 'pending',
-        step: 0,
-        total: 6
-      })
+      // finalize
+      const fin = await fetch(`${API}/analyze/finalize`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+        file_id: fileId,
+        purpose: outputs['purpose'] || '',
+        commercial: outputs['commercial'] || '',
+        legal_risks: outputs['legal_risks'] || '',
+        mitigations: outputs['mitigations'] || '',
+        alert: outputs['alert'] || '',
+        plain: ''
+      }) })
+      if (!fin.ok) throw new Error('Finalize failed')
+      const finJson = await fin.json()
+      const rr = finJson?.raw_report_url as string | undefined
+      if (!rr) throw new Error('No raw_report_url')
+      const rawRes = await fetch(`${API}${rr}`, { cache: 'no-store' as RequestCache })
+      if (!rawRes.ok) throw new Error('raw.json fetch failed')
+      const raw = await rawRes.json()
 
-      // Start polling for status
-      pollJobStatus(job_id)
+      setResult({
+        report_url: finJson?.report_url,
+        raw_report_url: rr,
+        raw_text_url: finJson?.raw_text_url,
+        contract_text: contractText,
+        purpose: raw?.purpose ?? outputs['purpose'] ?? '',
+        plain: raw?.plain ?? '',
+        commercial: raw?.commercial ?? outputs['commercial'] ?? '',
+        legal_risks: raw?.legal_risks ?? outputs['legal_risks'] ?? '',
+        mitigations: raw?.mitigations ?? outputs['mitigations'] ?? '',
+        alert: raw?.alert ?? outputs['alert'] ?? '',
+        meta: raw?.meta,
+      })
+      setJob({ id: fileId, status: 'done', step: 6, total: 6 })
+      setLoading(false)
     } catch (error) {
       console.error('Analysis failed:', error)
       setLoading(false)
-      alert('Failed to start analysis. Please check your connection and try again.')
-    }
-  }
-
-  const pollJobStatus = async (jobId: string) => {
-    try {
-      while (!abortPollRef.current) {
-        const response = await fetch(`${API}/analyze/status/${jobId}`)
-        
-        if (!response.ok) {
-          throw new Error('Failed to get job status')
-        }
-
-        const statusData = await response.json()
-
-        if (abortPollRef.current) break
-
-        setJob({
-          id: jobId,
-          status: statusData.status,
-          step: statusData.step || 0,
-          total: statusData.total_steps || 6,
-          message: statusData.message,
-          agent: statusData.current_agent,
-          label: statusData.current_label,
-          partials: statusData.partials
-        })
-
-        if (statusData.status === 'done' && statusData.result) {
-          // Strictly load raw.json and display only that
-          const rr = statusData?.result?.raw_report_url as string | undefined
-          if (rr) {
-            try {
-              let fr = await fetch(`${API}${rr}`, { cache: 'no-store' as RequestCache })
-              if (!fr.ok && fr.status === 304) {
-                fr = await fetch(`${API}${rr}`, { cache: 'reload' as RequestCache })
-              }
-              if (fr.ok) {
-                const raw = await fr.json()
-                setResult({
-                  report_url: statusData?.result?.report_url,
-                  raw_report_url: rr,
-                  raw_text_url: statusData?.result?.raw_text_url,
-                  // Prefer the full contract text if available from partials for Chat/optional view
-                  contract_text: statusData?.partials?.contract_text || '(Contract text unavailable in this session)',
-                  // Values strictly from raw.json
-                  purpose: raw?.purpose ?? '',
-                  plain: raw?.plain ?? '',
-                  commercial: raw?.commercial ?? '',
-                  legal_risks: raw?.legal_risks ?? '',
-                  mitigations: raw?.mitigations ?? '',
-                  alert: raw?.alert ?? '',
-                  meta: raw?.meta,
-                })
-                setLoading(false)
-                break
-              } else {
-                throw new Error('raw.json not yet available')
-              }
-            } catch (e) {
-              alert(`Could not fetch raw.json: ${e}`)
-            }
-          } else {
-            alert('raw_report_url missing; cannot display results')
-          }
-          setLoading(false)
-          break
-        }
-
-        if (statusData.status === 'error') {
-          setLoading(false)
-          alert(`Analysis failed: ${statusData.message || 'Unknown error'}`)
-          break
-        }
-
-        if (statusData.status === 'cancelled') {
-          setLoading(false)
-          break
-        }
-
-        // Wait before next poll
-        await new Promise(resolve => setTimeout(resolve, 1500))
-      }
-    } catch (error) {
-      console.error('Polling failed:', error)
-      setLoading(false)
-      alert('Lost connection to analysis. Please try again.')
+      alert('Failed to analyze. Please check your connection and try again.')
     }
   }
 
   const handleCancelJob = async () => {
-    if (!job?.id) return
-
-    abortPollRef.current = true
-    
-    try {
-      await fetch(`${API}/analyze/cancel/${job.id}`, { method: 'POST' })
-    } catch (error) {
-      console.warn('Failed to cancel job:', error)
-    }
-
+    abortRef.current = true
     setLoading(false)
     setJob(null)
   }
@@ -272,6 +209,8 @@ export default function App() {
             onFileSelect={handleFileSelect}
             onAnalyze={startAnalysis}
             isLoading={loading}
+            recipientEmail={recipientEmail}
+            onRecipientChange={setRecipientEmail}
           />
         )}
 

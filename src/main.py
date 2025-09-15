@@ -15,7 +15,7 @@ from rich.panel import Panel
 
 from src.utils.pdf_loader import load_pdf_text
 from src.utils.emailer import send_email
-from src.utils.chunker import chunk_by_words
+from src.utils.json_sanitizer import extract_json_object
 from src.agents.contract_agents import (
     make_alert_agent,
     make_chat_agent,
@@ -121,16 +121,7 @@ def build_agents_and_tasks(contract_text: str, model: str | None = None):
 def run_analysis_iter(contract_path: Path, model: str | None = None, on_partial: Optional[Callable[[str, Dict[str, Any]], None]] = None):
     """Yield (label, output_string) per task sequentially."""
     text = load_pdf_text(contract_path)
-    # Configure chunking
-    try:
-        chunk_tokens = int(os.getenv("CHUNK_TOKENS", "45000"))
-    except ValueError:
-        chunk_tokens = 45000
-    try:
-        chunk_overlap = int(os.getenv("CHUNK_OVERLAP", "500"))
-    except ValueError:
-        chunk_overlap = 500
-    chunks = chunk_by_words(text, chunk_tokens=chunk_tokens, overlap_tokens=chunk_overlap)
+    # No chunking: single full-context pass per task
     enforced_model = model or _resolve_model()
     agents, tasks, labels = build_agents_and_tasks(text, enforced_model)
 
@@ -222,48 +213,52 @@ def run_analysis_iter(contract_path: Path, model: str | None = None, on_partial:
     # No chunking or combining; single full-context pass per task
 
     for agent, task, label in zip(agents, tasks, labels):
-        # Purpose and alert: single full-context run
-        if label in ("purpose", "alert"):
-            out_raw = _run_single(agent, task, label)
-            out = out_raw or ""
-            if on_partial:
-                try:
-                    on_partial(label, {f"{label}_raw": out_raw})
-                except Exception:
-                    pass
-            if on_partial:
-                on_partial(label, {label: out, f"{label}_raw": out, "_progress": 1.0})
-            outputs[label] = str(out or "")
-            yield label, str(out or "")
-            continue
-
-        # Chunked tasks: commercial, legal_risks, mitigations
-        raw_concat_parts: list[str] = []
-        for i, ctext in enumerate(chunks, start=1):
-            # Replace contract_text placeholder per chunk
-            t = Task(description=task.description.replace(text, ctext), agent=agent, expected_output=task.expected_output)
-            out_raw = _run_single(agent, t, f"{label}#chunk-{i}")
-            raw_concat_parts.append(out_raw or "")
-            if on_partial:
-                on_partial(label, {f"{label}_raw": out_raw, "_chunk": i, "_progress": i / max(1, len(chunks))})
-        out = "\n".join(raw_concat_parts).strip()
+        # Single full-context run for all tasks
+        out_raw = _run_single(agent, task, label)
+        out = out_raw or ""
+        if on_partial:
+            try:
+                on_partial(label, {f"{label}_raw": out_raw})
+            except Exception:
+                pass
         if on_partial:
             on_partial(label, {label: out, f"{label}_raw": out, "_progress": 1.0})
         outputs[label] = str(out or "")
         yield label, str(out or "")
 
 
-def maybe_send_alert(alert_json: str, contract_name: str) -> None:
-    try:
-        data = json.loads(alert_json)
-    except Exception:
+def maybe_send_alert(alert_json: str, contract_name: str, pdf_path: Optional[Path] = None, recipient_override: Optional[str] = None) -> None:
+    # Be robust to fenced JSON or extra text
+    data = extract_json_object(alert_json) or {}
+    if not data:
+        try:
+            data = json.loads(alert_json)
+        except Exception:
+            print("[alert] could not parse alert JSON; skipping email")
+            return
+    exploitative = bool(str(data.get("exploitative")).lower() == "true" or data.get("exploitative") is True)
+    # Determine recipient: override from caller -> .env ALERT_TO_EMAIL -> ALERT_FROM_EMAIL -> SENDER_EMAIL
+    recipient = (
+        recipient_override
+        or os.getenv("ALERT_TO_EMAIL")
+        or os.getenv("ALERT_FROM_EMAIL")
+        or os.getenv("SENDER_EMAIL")
+    )
+    if not exploitative:
+        print("[alert] exploitative=false; no email will be sent")
         return
-    exploitative = bool(data.get("exploitative"))
-    recipient = os.getenv("ALERT_TO_EMAIL")
-    if exploitative and recipient:
-        subject = f"Exploitative contract detected: {contract_name}"
-        body = json.dumps(data, indent=2)
-        send_email(recipient, subject, body)
+    if not recipient:
+        print("[alert] no recipient configured; set recipient override, ALERT_TO_EMAIL, or ALERT_FROM_EMAIL")
+        return
+    subject = f"Exploitative contract detected: {contract_name}"
+    body = json.dumps(data, indent=2)
+    attachments = [pdf_path] if pdf_path else None
+    try:
+        send_email(recipient, subject, body, attachments=attachments)
+        print(f"[alert] email sent to {recipient}")
+    except Exception as e:
+        # Don't crash overall flow on email issues
+        print(f"[alert] failed to send email: {e}")
 
 
 def save_report(result: AnalysisResult, out_dir: Path, contract_name: str, model: Optional[str] = None, raw: Optional[Dict[str, str]] = None) -> Path:

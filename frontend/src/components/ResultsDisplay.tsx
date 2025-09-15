@@ -22,7 +22,7 @@ interface ResultsDisplayProps {
 export default function ResultsDisplay({ result, apiUrl }: ResultsDisplayProps) {
   const [activeTab, setActiveTab] = useState('summary')
   const [showContract, setShowContract] = useState(false)
-  const [showRawOutput, setShowRawOutput] = useState(false)
+  // Removed debug raw output toggle
 
   // Helpers to extract JSON even if wrapped in triple quotes or code fences
   const unwrapCodeOrQuotes = (txt?: string): string => {
@@ -234,12 +234,7 @@ export default function ResultsDisplay({ result, apiUrl }: ResultsDisplayProps) 
           >
             {showContract ? 'Hide' : 'Show'} Contract Text
           </button>
-          <button
-            className="btn btn-outline btn-sm"
-            onClick={() => setShowRawOutput(!showRawOutput)}
-          >
-            {showRawOutput ? 'Hide Raw' : 'Show Raw'}
-          </button>
+          {/* Debug raw toggle removed */}
           {result.report_url && (
             <a 
               href={`${apiUrl.replace(/\/$/, '')}${result.report_url}`}
@@ -250,28 +245,7 @@ export default function ResultsDisplay({ result, apiUrl }: ResultsDisplayProps) 
               Download Report
             </a>
           )}
-          {result.raw_report_url && (
-            <a 
-              href={`${apiUrl.replace(/\/$/, '')}${result.raw_report_url}`}
-              target="_blank" 
-              rel="noreferrer"
-              className="btn btn-outline btn-sm"
-              style={{ marginLeft: 8 }}
-            >
-              raw.json
-            </a>
-          )}
-          {result.raw_text_url && (
-            <a 
-              href={`${apiUrl.replace(/\/$/, '')}${result.raw_text_url}`}
-              target="_blank" 
-              rel="noreferrer"
-              className="btn btn-outline btn-sm"
-              style={{ marginLeft: 8 }}
-            >
-              raw.txt
-            </a>
-          )}
+          {/* raw.json and raw.txt links removed */}
         </div>
       </div>
 
@@ -285,23 +259,7 @@ export default function ResultsDisplay({ result, apiUrl }: ResultsDisplayProps) 
       )}
 
       <div className="tabs-container">
-        {showRawOutput && (
-          <div className="content-card" style={{margin: '16px'}}>
-            <h4>Raw Outputs (debug)</h4>
-            <details open>
-              <summary>Legal Risks</summary>
-              <pre className="plain-text">{risksRaw}</pre>
-            </details>
-            <details>
-              <summary>Mitigations</summary>
-              <pre className="plain-text">{mitigationsRaw}</pre>
-            </details>
-            <details>
-              <summary>Alert</summary>
-              <pre className="plain-text">{alertRaw}</pre>
-            </details>
-          </div>
-        )}
+        {/* Debug raw output panel removed */}
         <div className="tabs-nav">
           {tabs.map(tab => (
             <button
