@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks
-import logging
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -17,14 +16,15 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.main import run_analysis, run_analysis_iter, save_report, maybe_send_alert, _resolve_ollama_model, AnalysisResult  # type: ignore
-from src.utils.json_sanitizer import extract_json_object, extract_json_array  # type: ignore
+from src.main import run_analysis, run_analysis_iter, save_report, maybe_send_alert, _resolve_model as _resolve_ollama_model, AnalysisResult  # type: ignore
 from src.utils.pdf_loader import load_pdf_text  # type: ignore
 
 app = FastAPI(title="Contract Analyzer API")
 DEV_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
     "http://localhost:4173",
     "http://127.0.0.1:4173",
 ]
@@ -36,17 +36,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Suppress noisy access logs for status polling
-class _SkipStatusFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            msg = record.getMessage()
-        except Exception:
-            return True
-        return "/analyze/status" not in msg
-
-logging.getLogger("uvicorn.access").addFilter(_SkipStatusFilter())
-
 load_dotenv()
 
 REPORTS_DIR = Path("reports")
@@ -54,10 +43,8 @@ UPLOADS_DIR = Path("uploads")
 UPLOADS_DIR.mkdir(exist_ok=True)
 REPORTS_DIR.mkdir(exist_ok=True)
 
-# Expose reports directory
 app.mount("/reports", StaticFiles(directory=str(REPORTS_DIR)), name="reports")
 
-# In-memory job store for simple progress tracking
 JOBS: Dict[str, Dict[str, Any]] = {}
 
 
@@ -65,9 +52,11 @@ class AnalyzeResponse(BaseModel):
     report_json_path: str
     report_file: str
     report_url: str
+    raw_report_url: str | None = None
+    raw_text_url: str | None = None
     exploitative: Optional[bool] = None
     rationale: Optional[str] = None
-    # Echo key sections to power the UI
+    # Echo key sections to power the UI (raw strings)
     contract_text: str
     purpose: str
     commercial: str
@@ -75,15 +64,65 @@ class AnalyzeResponse(BaseModel):
     mitigations: str
     alert: str
     plain: str
-    # Parsed fields for cleaner UI when possible
-    commercial_parsed: Optional[dict] = None
-    legal_risks_parsed: Optional[list] = None
-    mitigations_parsed: Optional[list] = None
-    alert_parsed: Optional[dict] = None
+    # Raw agent outputs for transparency/debugging
+    debug_raw: Optional[Dict[str, Any]] = None
+
+@app.get("/api/reports/list")
+def api_list_reports():
+    try:
+        files = []
+        for p in REPORTS_DIR.glob("*_analysis.json"):
+            files.append({
+                "name": p.name,
+                "size": p.stat().st_size,
+                "mtime": p.stat().st_mtime,
+                "url": f"/reports/{p.name}",
+            })
+        files.sort(key=lambda x: x["mtime"], reverse=True)
+        return {"reports": files}
+    except Exception as e:
+        return {"error": f"failed to list reports: {e}"}
+
+
+def _sanitize_plain(text: str) -> str:
+    """Basic formatting cleanup only - no content filtering."""
+    if not text:
+        return text
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    return "\n".join(lines)
+
+def _sanitize_no_thought(text: str) -> str:
+    if not text:
+        return text
+    lines = [l for l in (text.splitlines()) if l.strip()]
+    banned = ("plan:", "analysis:", "thought:", "internal:")
+    out = []
+    for l in lines:
+        low = l.strip().lower()
+        if any(low.startswith(b) for b in banned):
+            continue
+        if low in ("plan", "analysis", "thought", "internal"):
+            continue
+        if low.startswith("```"):
+            continue
+        out.append(l)
+    return "\n".join(out).strip()
+
+
+def _sanitize_chat_answer(text: str, question: str) -> str:
+    """Basic formatting cleanup only - no content filtering."""
+    if not text:
+        return text
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return "Not stated in the contract."
+    # Just return clean lines, no content validation
+    return "\n".join(lines[:3])
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
@@ -94,41 +133,45 @@ async def analyze_contract(file: UploadFile = File(...)):
     with pdf_path.open("wb") as f:
         f.write(contents)
 
-    # Enforce local Ollama model and run analysis
+    # Resolve model (Gemini-only) and run analysis
     model = _resolve_ollama_model()
     result = run_analysis(pdf_path, model=model)
-    out_path = save_report(result, REPORTS_DIR, pdf_path.stem)
+    raw_payload = {
+        "purpose": result.purpose,
+        "commercial": result.commercial,
+        "legal_risks": result.legal_risks,
+        "mitigations": result.mitigations,
+        "alert": result.alert,
+        "plain": result.plain,
+    }
+    out_path = save_report(result, REPORTS_DIR, pdf_path.stem, model=model, raw=raw_payload)
     name = out_path.name
     url = f"/reports/{name}"
+    # derive raw pair filename
+    raw_name = name.replace("_analysis.json", "_raw.json")
+    raw_url = f"/reports/{raw_name}"
+    raw_txt = name.replace("_analysis.json", "_raw.txt")
+    raw_txt_url = f"/reports/{raw_txt}"
 
-    # Parse and lightly post-process outputs for UI
+    # Use raw strings as-is for UI
     exploitative = None
     rationale = None
-    commercial_parsed = None
-    legal_risks_parsed = None
-    mitigations_parsed = None
-    alert_parsed = None
-    # Robust parsing using sanitizer (handles extra text around JSON)
-    obj = extract_json_object(result.commercial)
-    commercial_parsed = obj if obj else None
-
-    risks = extract_json_array(result.legal_risks)[:8]
-    legal_risks_parsed = risks if risks else None
-
-    mits = extract_json_array(result.mitigations)[:8]
-    mitigations_parsed = mits if mits else None
-
-    al = extract_json_object(result.alert)
-    if al:
-        alert_parsed = al
-        exploitative = bool(al.get("exploitative"))
-        rationale = al.get("rationale")
-    else:
-        alert_parsed = None
+    purpose_text = result.purpose
 
     # Optional email alert
     maybe_send_alert(result.alert, pdf_path.name)
 
+    # Build final plain: sanitize formatting + remove potential internal thought lines
+    final_plain = _sanitize_no_thought(_sanitize_plain(result.plain))
+
+    debug_payload = {
+        "purpose": purpose_text,
+        "commercial": result.commercial,
+        "legal_risks": result.legal_risks,
+        "mitigations": result.mitigations,
+        "alert": result.alert,
+        "plain": final_plain,
+    }
     return AnalyzeResponse(
         report_json_path=str(out_path),
         report_file=name,
@@ -136,16 +179,15 @@ async def analyze_contract(file: UploadFile = File(...)):
         exploitative=exploitative,
         rationale=rationale,
         contract_text=load_pdf_text(pdf_path),
-        purpose=result.purpose,
+        purpose=purpose_text,
         commercial=result.commercial,
         legal_risks=result.legal_risks,
         mitigations=result.mitigations,
         alert=result.alert,
-        plain=result.plain,
-        commercial_parsed=commercial_parsed,
-        legal_risks_parsed=legal_risks_parsed,
-        mitigations_parsed=mitigations_parsed,
-        alert_parsed=alert_parsed,
+        plain=final_plain,
+        raw_report_url=raw_url,
+        raw_text_url=raw_txt_url,
+        debug_raw=debug_payload,
     )
 
 
@@ -164,14 +206,20 @@ class AnalyzeStatusResponse(BaseModel):
     result: Optional[AnalyzeResponse] = None
     # Partials as tasks complete
     partials: Optional[Dict[str, Any]] = None
+    # Raw outputs for debugging
+    debug_raw: Optional[Dict[str, Any]] = None
 
 
 def _run_job(job_id: str, pdf_path: Path):
+    import traceback
     try:
-        JOBS[job_id]["status"] = "running"
-        JOBS[job_id]["step"] = 0
-        JOBS[job_id]["message"] = "Starting"
-        JOBS[job_id]["outputs"] = {}
+        j = JOBS.get(job_id)
+        if not j:
+            return
+        j["status"] = "running"
+        j["step"] = 0
+        j["message"] = "Starting"
+        j["outputs"] = j.get("outputs") or {}
         model = _resolve_ollama_model()
 
         # Make full contract text available to the frontend immediately
@@ -188,16 +236,21 @@ def _run_job(job_id: str, pdf_path: Path):
             ("Legal Risk Assessor", "legal_risks"),
             ("Mitigation Strategist", "mitigations"),
             ("Exploitative Contract Detector", "alert"),
-            ("Plain-Language Simplifier", "plain"),
         ]
         total = len(steps) + 1  # +1 for saving report
         JOBS[job_id]["total_steps"] = total
 
         # Iterate tasks sequentially and update status
         def _on_partial(part_label: str, data: Dict[str, Any]):
-            cur = JOBS[job_id].get("outputs") or {}
+            job = JOBS.get(job_id)
+            if not job or job.get("cancelled"):
+                return
+            # indicate which label is currently streaming
+            job["current_label"] = part_label
+            job["message"] = "Running"
+            cur = job.get("outputs") or {}
             cur.update(data)
-            JOBS[job_id]["outputs"] = cur
+            job["outputs"] = cur
 
         for idx, (label, out) in enumerate(run_analysis_iter(pdf_path, model=model, on_partial=_on_partial), start=1):
             if JOBS.get(job_id, {}).get("cancelled"):
@@ -206,101 +259,105 @@ def _run_job(job_id: str, pdf_path: Path):
                 return
             # Find friendly agent name
             agent_name = next((name for name, lab in steps if lab == label), label)
-            JOBS[job_id]["step"] = idx
-            JOBS[job_id]["message"] = "Running"
-            JOBS[job_id]["current_agent"] = agent_name
-            JOBS[job_id]["current_label"] = label
+            job = JOBS.get(job_id)
+            if not job or job.get("cancelled"):
+                return
+            job["step"] = idx
+            job["message"] = "Running"
+            job["current_agent"] = agent_name
+            job["current_label"] = label
             outputs[label] = out
             # Update partials for frontend
-            part: Dict[str, Any] = {label: out}
-            # Try parsed fields
-            if label == "commercial":
-                obj = extract_json_object(out)
-                if obj:
-                    part["commercial_parsed"] = obj
-            elif label == "legal_risks":
-                arr = extract_json_array(out)
-                if arr:
-                    part["legal_risks_parsed"] = arr[:8]
-            elif label == "mitigations":
-                arr = extract_json_array(out)
-                if arr:
-                    part["mitigations_parsed"] = arr[:8]
-            elif label == "alert":
-                al = extract_json_object(out)
-                if al:
-                    part["alert_parsed"] = al
-            # merge into job outputs
-            if not JOBS.get(job_id, {}).get("cancelled"):
-                cur = JOBS[job_id].get("outputs") or {}
+            part: Dict[str, Any] = {label: out, f"{label}_raw": out}
+            # no parsing or transformation; keep exactly as returned
+            # merge into job outputs (race-safe if job was cleared or cancelled)
+            job_now = JOBS.get(job_id)
+            if job_now and not job_now.get("cancelled"):
+                cur = (job_now.get("outputs") or {}).copy()
                 cur.update(part)
-                JOBS[job_id]["outputs"] = cur
+                job_now["outputs"] = cur
 
-        if JOBS.get(job_id, {}).get("cancelled"):
-            JOBS[job_id]["message"] = "Cancelled"
-            JOBS[job_id]["status"] = "cancelled"
+        job = JOBS.get(job_id)
+        if not job:
             return
-        JOBS[job_id]["step"] = total
+        if job.get("cancelled"):
+            job["message"] = "Cancelled"
+            job["status"] = "cancelled"
+            return
+        job["step"] = total
         JOBS[job_id]["message"] = "Saving report"
+        # Build final plain formatting only
+        plain_raw = str(outputs.get("plain", ""))
+        plain_sane = _sanitize_no_thought(_sanitize_plain(plain_raw))
+
         analysis_result = AnalysisResult(
             purpose=str(outputs.get("purpose", "")),
             commercial=str(outputs.get("commercial", "")),
             legal_risks=str(outputs.get("legal_risks", "")),
             mitigations=str(outputs.get("mitigations", "")),
             alert=str(outputs.get("alert", "")),
-            plain=str(outputs.get("plain", "")),
+            plain=plain_sane,
         )
-        out_path = save_report(analysis_result, REPORTS_DIR, pdf_path.stem)
+        # Collect raw outputs as-is, preferring *_raw captured earlier
+        job_out = (JOBS.get(job_id, {}).get("outputs") or {})
+        raw_payload = {
+            "purpose": str(job_out.get("purpose_raw", outputs.get("purpose", ""))),
+            "commercial": str(job_out.get("commercial_raw", outputs.get("commercial", ""))),
+            "legal_risks": str(job_out.get("legal_risks_raw", outputs.get("legal_risks", ""))),
+            "mitigations": str(job_out.get("mitigations_raw", outputs.get("mitigations", ""))),
+            "alert": str(job_out.get("alert_raw", outputs.get("alert", ""))),
+            "plain": str(outputs.get("plain", "")),
+        }
+        out_path = save_report(analysis_result, REPORTS_DIR, pdf_path.stem, model=model, raw=raw_payload)
         name = out_path.name
         url = f"/reports/{name}"
+        raw_name = name.replace("_analysis.json", "_raw.json")
+        raw_url = f"/reports/{raw_name}"
+        raw_txt = name.replace("_analysis.json", "_raw.txt")
+        raw_txt_url = f"/reports/{raw_txt}"
 
-        # Parse fields like in /analyze
+        # No parsing; keep values as-is
         exploitative = None
         rationale = None
-        commercial_parsed = None
-        legal_risks_parsed = None
-        mitigations_parsed = None
-        alert_parsed = None
-        obj = extract_json_object(analysis_result.commercial)
-        commercial_parsed = obj if obj else None
+        purpose_text = analysis_result.purpose
 
-        risks = extract_json_array(analysis_result.legal_risks)[:8]
-        legal_risks_parsed = risks if risks else None
-
-        mits = extract_json_array(analysis_result.mitigations)[:8]
-        mitigations_parsed = mits if mits else None
-
-        al = extract_json_object(analysis_result.alert)
-        if al:
-            alert_parsed = al
-            exploitative = bool(al.get("exploitative"))
-            rationale = al.get("rationale")
-
-        # Reconstruct a result-like object from outputs
+        # Reconstruct a result-like object from raw job outputs for debugging
+        debug_payload = {
+            "purpose": str(job_out.get("purpose_raw", analysis_result.purpose)),
+            "commercial": str(job_out.get("commercial_raw", analysis_result.commercial)),
+            "legal_risks": str(job_out.get("legal_risks_raw", analysis_result.legal_risks)),
+            "mitigations": str(job_out.get("mitigations_raw", analysis_result.mitigations)),
+            "alert": str(job_out.get("alert_raw", analysis_result.alert)),
+            "plain": plain_sane,
+        }
         JOBS[job_id]["result"] = AnalyzeResponse(
             report_json_path=str(out_path),
             report_file=name,
             report_url=url,
+            raw_report_url=raw_url,
+            raw_text_url=raw_txt_url,
             exploitative=exploitative,
             rationale=rationale,
             contract_text=load_pdf_text(pdf_path),
-            purpose=analysis_result.purpose,
+            purpose=purpose_text,
             commercial=analysis_result.commercial,
             legal_risks=analysis_result.legal_risks,
             mitigations=analysis_result.mitigations,
             alert=analysis_result.alert,
             plain=analysis_result.plain,
-            commercial_parsed=commercial_parsed,
-            legal_risks_parsed=legal_risks_parsed,
-            mitigations_parsed=mitigations_parsed,
-            alert_parsed=alert_parsed,
+            debug_raw=debug_payload,
         )
-        JOBS[job_id]["step"] = total
-        JOBS[job_id]["message"] = "Done"
-        JOBS[job_id]["status"] = "done"
+        job = JOBS.get(job_id)
+        if job:
+            job["step"] = total
+            job["message"] = "Done"
+            job["status"] = "done"
     except Exception as e:
-        JOBS[job_id]["status"] = "error"
-        JOBS[job_id]["message"] = str(e)
+        tb = traceback.format_exc()
+        job = JOBS.get(job_id)
+        if job:
+            job["status"] = "error"
+            job["message"] = f"{type(e).__name__}: {e}\n{tb}"
 
 
 @app.post("/analyze/start", response_model=AnalyzeStartResponse)
@@ -312,7 +369,8 @@ async def analyze_start(background: BackgroundTasks, file: UploadFile = File(...
 
     job_id = os.urandom(8).hex()
     # Set total_steps to the real count (+1 for saving)
-    total_steps = 6 + 1
+    # Steps: purpose, commercial, legal_risks, mitigations, alert + save
+    total_steps = 5 + 1
     JOBS[job_id] = {
         "status": "pending",
         "step": 0,
@@ -334,6 +392,17 @@ async def analyze_status(job_id: str):
     job = JOBS.get(job_id)
     if not job:
         return AnalyzeStatusResponse(job_id=job_id, status="error", step=0, total_steps=4, message="job not found", result=None)
+    # Surface any intermediate raw outputs if present
+    outputs = job.get("outputs") or {}
+    # Prefer *_raw values when available; fall back to plain keys
+    debug_payload = {
+        "purpose": outputs.get("purpose_raw") or outputs.get("purpose"),
+        "commercial": outputs.get("commercial_raw") or outputs.get("commercial"),
+        "legal_risks": outputs.get("legal_risks_raw") or outputs.get("legal_risks"),
+        "mitigations": outputs.get("mitigations_raw") or outputs.get("mitigations"),
+        "alert": outputs.get("alert_raw") or outputs.get("alert"),
+        "plain": outputs.get("plain"),
+    }
     return AnalyzeStatusResponse(
         job_id=job_id,
         status=job.get("status", "pending"),
@@ -344,6 +413,7 @@ async def analyze_status(job_id: str):
         current_label=job.get("current_label"),
         result=job.get("result"),
         partials=job.get("outputs"),
+        debug_raw=debug_payload,
     )
 
 
@@ -356,7 +426,15 @@ async def analyze_cancel(job_id: str):
     if job.get("status") not in {"done", "error", "cancelled"}:
         job["status"] = "cancelled"
         job["message"] = "Stopped by user"
-    return {"ok": True}
+    # Clear outputs immediately and try to delete uploaded file
+    try:
+        job["outputs"] = {}
+        p = job.get("pdf_path")
+        if p:
+            Path(p).unlink(missing_ok=True)
+    except Exception:
+        pass
+    return {"ok": True, "status": job.get("status")}
 
 
 @app.post("/analyze/clear/{job_id}")
@@ -395,7 +473,7 @@ async def chat(req: ChatRequest):
     from src.agents.contract_agents import make_chat_agent
     from src.tasks.contract_tasks import chat_task
 
-    # Use Ollama model for chat agent as well
+    # Use Gemini model for chat agent as well
     from crewai import LLM  # type: ignore
     model = _resolve_ollama_model()
     agent = make_chat_agent(LLM(model=model))
@@ -407,5 +485,7 @@ async def chat(req: ChatRequest):
         answer = task.output.raw if hasattr(task, "output") else ""
     except Exception:
         answer = ""
+    # Sanitize chat output to remove headings/markdown and enforce brevity
+    answer = _sanitize_chat_answer(answer, req.question)
 
     return {"answer": answer}

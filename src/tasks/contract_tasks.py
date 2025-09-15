@@ -3,22 +3,34 @@ from __future__ import annotations
 from crewai import Task
 
 PURPOSE_PROMPT = (
-    "Summarize the contract for a busy reader in 2–3 short sentences: what it’s for, the scope, and the main deliverables. "
-    "Be direct and concrete. Keep it under 80 words.\n\nContract:\n{contract_text}"
+    "Return a JSON object with a single 'summary' field containing a 3-6 sentence summary of the contract's primary purpose, scope, and deliverables. "
+    "Example: {\"summary\": \"This contract establishes...\"}. "
+    "Do not include any other text outside the JSON object."
+    "\n\nContract:\n{contract_text}"
 )
 
 COMMERCIAL_PROMPT = (
-    "List the core commercial terms as a compact JSON object with these keys: payment_terms, pricing_model, quantities, buyer_obligations, supplier_obligations. "
-    "Keep values brief (≤200 chars). If something isn’t stated, use an empty string ''. Reply with JSON only—no extra words.\n\nContract:\n{contract_text}"
+    "Extract commercial clauses only. Return JSON array only (no prose).\n"
+    "Each item must have at least: {\"clause\": \"title or section name\", \"summary\": \"what it specifies\"}.\n"
+    "Optional fields you may include when present: amounts, currency, dates, parties, obligations, payment_terms, pricing_model, quantities.\n"
+    "MANDATORY: Return 5–15 items. Do NOT return an empty array. Use exact figures/dates from the contract where available.\n\n"
+    "Contract:\n{contract_text}"
 )
 
 LEGAL_RISK_PROMPT = (
-    "Identify up to 8 important legal risks. Return a JSON array only. Each item: {clause: string≤180, risk: string≤180, fairness: fair|unfair, favours: buyer|supplier|equal, severity: low|medium|high}.\n\n"
+    "MANDATORY: Identify at least 3-8 legal risks from this contract. Even if terms seem balanced, analyze potential risks. "
+    "Return a JSON array only. Each item must have: {\"clause\": \"specific clause/section\", \"risk\": \"what could go wrong\", \"description\": \"why this is a legal risk (cite clause language)\", \"fairness\": \"fair|unfair\", \"favours\": \"buyer|supplier|equal\", \"severity\": \"low|medium|high\"}.\n\n"
+    "Focus on: liability, indemnification, termination, IP ownership, payment terms, warranties, force majeure, governing law, dispute resolution.\n"
+    "Do NOT return an empty array. If contract seems simple, identify at least basic risks like payment delays, termination conditions, etc.\n\n"
+    "Strictly output JSON only inside a single ```json fenced block. No prose, no markdown outside the fence.\n\n"
     "Contract:\n{contract_text}"
 )
 
 MITIGATION_PROMPT = (
-    "Suggest practical mitigations matching the key risks (same order). Return JSON array only. Each item: {clause: string≤120, mitigation: string≤180, negotiation_points: string≤180}.\n\n"
+    "MANDATORY: Suggest at least 3-8 practical mitigations for contract risks. Return JSON array only. "
+    "Each item must have: {\"clause\": \"clause/section being addressed\", \"mitigation\": \"specific action to reduce risk\", \"negotiation_points\": \"what to negotiate\"}.\n\n"
+    "Focus on common mitigations: liability caps, termination notice periods, IP protections, payment security, warranty limits, dispute procedures.\n"
+    "Do NOT return an empty array. Even for simple contracts, suggest basic protections.\n\n"
     "Contract:\n{contract_text}"
 )
 
@@ -28,18 +40,25 @@ ALERT_PROMPT = (
 )
 
 SIMPLIFIER_PROMPT = (
-    "Explain this contract so anyone can understand it without losing key legal meaning. "
-    "Use very simple words and short lines. If a legal term appears, add a plain meaning in brackets (e.g., indemnity [who pays for harm]). "
-    "Write 8–10 bullets, each ≤140 characters. Start lines with You:, They:, or Both:. Include things like purpose, duties, money, deadlines, changes, IP, confidentiality, limits on damages, indemnity, termination, law/court, late fees, privacy, warranties, acceptance/tests. "
-    "Finish with 1–2 Watch out: lines for the biggest risks. No intro/outro.\n\nContract:\n{contract_text}"
+    "Explain this specific contract in bullet points only, based strictly on the contract text. Do NOT define what a contract is. "
+    "Keep legal nuances intact: do not oversimplify; include what each clause does and why it matters. "
+    "If a legal term appears, add a plain meaning in brackets (e.g., indemnity [who pays for harm]). "
+    "Requirements:\n"
+    "- 10–14 bullets; length per bullet can be longer if needed to preserve nuance.\n"
+    "- Start each line with You:, They:, Both:, or Watch out:.\n"
+    "- Use exact party names and figures/dates from the contract when present.\n"
+    "- If something isn’t stated, write 'Not stated'.\n"
+    "- No intro/outro. No headings. No 'Answer' text.\n\n"
+    "Contract:\n{contract_text}"
 )
 
 CHAT_PROMPT = (
-    "Answer the question strictly from the contract. If something isn’t stated, say: Not stated in the contract.\n"
-    "Format:\n"
-    "- Direct answer first (≤20 words). If yes/no, start with Yes. or No.\n"
-    "- Then a short reason with clause ref(s) in parentheses, e.g., (Clause 5, Termination).\n"
-    "- If multiple parts, label A), B). Keep total under 100 words.\n\n"
+    "Answer strictly from the contract. If not stated, reply: Not stated in the contract.\n"
+    "Rules:\n"
+    "- Line 1: Direct answer (≤20 words). If yes/no, start with Yes. or No. No markdown, no headings.\n"
+    "- Line 2: Reason with clause ref(s) in parentheses, e.g., (Clause 5, Termination).\n"
+    "- Optional Line 3: B) if the question has distinct parts.\n"
+    "- Keep total under 100 words. No 'Final Answer', no banners, no markdown.\n\n"
     "Contract:\n{contract_text}\n\nAnalysis:\n{analysis}\n\nQuestion:\n{question}"
 )
 
@@ -49,7 +68,7 @@ def purpose_task(agent) -> Task:
 
 
 def commercial_task(agent) -> Task:
-    return Task(description=COMMERCIAL_PROMPT, agent=agent, expected_output="Strict JSON object for commercial terms")
+    return Task(description=COMMERCIAL_PROMPT, agent=agent, expected_output="Strict JSON array of commercial clause objects")
 
 
 def legal_risk_task(agent) -> Task:
@@ -65,7 +84,7 @@ def alert_task(agent) -> Task:
 
 
 def simplifier_task(agent) -> Task:
-    return Task(description=SIMPLIFIER_PROMPT, agent=agent, expected_output="Max 8 short bullets")
+    return Task(description=SIMPLIFIER_PROMPT, agent=agent, expected_output="Thorough plain-language bullets preserving nuance")
 
 
 def chat_task(agent, contract_text: str, analysis: str, question: str) -> Task:
