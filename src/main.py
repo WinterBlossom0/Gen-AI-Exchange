@@ -15,6 +15,7 @@ from rich.panel import Panel
 
 from src.utils.pdf_loader import load_pdf_text
 from src.utils.emailer import send_email
+from src.utils.chunker import chunk_by_words
 from src.agents.contract_agents import (
     make_alert_agent,
     make_chat_agent,
@@ -120,6 +121,16 @@ def build_agents_and_tasks(contract_text: str, model: str | None = None):
 def run_analysis_iter(contract_path: Path, model: str | None = None, on_partial: Optional[Callable[[str, Dict[str, Any]], None]] = None):
     """Yield (label, output_string) per task sequentially."""
     text = load_pdf_text(contract_path)
+    # Configure chunking
+    try:
+        chunk_tokens = int(os.getenv("CHUNK_TOKENS", "45000"))
+    except ValueError:
+        chunk_tokens = 45000
+    try:
+        chunk_overlap = int(os.getenv("CHUNK_OVERLAP", "500"))
+    except ValueError:
+        chunk_overlap = 500
+    chunks = chunk_by_words(text, chunk_tokens=chunk_tokens, overlap_tokens=chunk_overlap)
     enforced_model = model or _resolve_model()
     agents, tasks, labels = build_agents_and_tasks(text, enforced_model)
 
@@ -211,23 +222,33 @@ def run_analysis_iter(contract_path: Path, model: str | None = None, on_partial:
     # No chunking or combining; single full-context pass per task
 
     for agent, task, label in zip(agents, tasks, labels):
-        # Single full-context run per label
-        out_raw = _run_single(agent, task, label)
-        out = out_raw or ""
-        # Emit raw output as-is for persistence/debug before any processing
-        if on_partial:
-            try:
-                on_partial(label, {f"{label}_raw": out_raw})
-            except Exception:
-                pass
-        # Emit raw partial for every label (no parsing)
+        # Purpose and alert: single full-context run
+        if label in ("purpose", "alert"):
+            out_raw = _run_single(agent, task, label)
+            out = out_raw or ""
+            if on_partial:
+                try:
+                    on_partial(label, {f"{label}_raw": out_raw})
+                except Exception:
+                    pass
+            if on_partial:
+                on_partial(label, {label: out, f"{label}_raw": out, "_progress": 1.0})
+            outputs[label] = str(out or "")
+            yield label, str(out or "")
+            continue
+
+        # Chunked tasks: commercial, legal_risks, mitigations
+        raw_concat_parts: list[str] = []
+        for i, ctext in enumerate(chunks, start=1):
+            # Replace contract_text placeholder per chunk
+            t = Task(description=task.description.replace(text, ctext), agent=agent, expected_output=task.expected_output)
+            out_raw = _run_single(agent, t, f"{label}#chunk-{i}")
+            raw_concat_parts.append(out_raw or "")
+            if on_partial:
+                on_partial(label, {f"{label}_raw": out_raw, "_chunk": i, "_progress": i / max(1, len(chunks))})
+        out = "\n".join(raw_concat_parts).strip()
         if on_partial:
             on_partial(label, {label: out, f"{label}_raw": out, "_progress": 1.0})
-
-        if label == "alert":
-            # Keep alert as returned by agent (raw)
-            pass
-
         outputs[label] = str(out or "")
         yield label, str(out or "")
 
