@@ -251,7 +251,30 @@ def maybe_send_alert(alert_json: str, contract_name: str, pdf_path: Optional[Pat
         print("[alert] no recipient configured; set recipient override, ALERT_TO_EMAIL, or ALERT_FROM_EMAIL")
         return
     subject = f"Exploitative contract detected: {contract_name}"
-    body = json.dumps(data, indent=2)
+    # Build a clean, human-friendly body (no raw JSON, no boolean flags)
+    rationale = str(data.get("rationale") or "Exploitative indicators detected in the contract.").strip()
+    clauses = data.get("top_unfair_clauses")
+    if not isinstance(clauses, list):
+        clauses = []
+    # Limit to a reasonable number of bullets
+    clauses = [str(c) for c in clauses][:10]
+    lines = [
+        f"Contract: {contract_name}",
+        "",
+        "Summary:",
+        f"- Rationale: {rationale}",
+    ]
+    if clauses:
+        lines.append("- Top unfair clauses:")
+        for c in clauses:
+            lines.append(f"  • {c}")
+    lines += [
+        "",
+        "Next steps:",
+        "- Review the attached PDF.",
+        "- Share with legal for clause-by-clause negotiation guidance.",
+    ]
+    body = "\n".join(lines).rstrip()
     attachments = [pdf_path] if pdf_path else None
     try:
         send_email(recipient, subject, body, attachments=attachments)
