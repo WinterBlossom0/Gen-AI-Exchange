@@ -10,7 +10,6 @@ venv/
 # Node
 frontend/node_modules/
 frontend/.env
-frontend/dist/
 
 # Local-only or backup
 *.bak
