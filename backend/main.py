@@ -50,6 +50,11 @@ JOBS: Dict[str, Dict[str, Any]] = {}
 FILES: Dict[str, Dict[str, Any]] = {}
 
 
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "Contract Analysis API is running"}
+
+
 class AnalyzeResponse(BaseModel):
     report_json_path: str
     report_file: str
