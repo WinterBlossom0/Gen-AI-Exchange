@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Callable, Optional
 import time
+import itertools
 
 from crewai import Crew, Process, Task
 from dotenv import load_dotenv
@@ -14,6 +15,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from src.utils.pdf_loader import load_pdf_text
+from src.utils.chunker import chunk_by_words
 from src.utils.emailer import send_email
 from src.utils.json_sanitizer import extract_json_object
 from src.agents.contract_agents import (
@@ -119,39 +121,72 @@ def build_agents_and_tasks(contract_text: str, model: str | None = None):
 
 
 def run_analysis_iter(contract_path: Path, model: str | None = None, on_partial: Optional[Callable[[str, Dict[str, Any]], None]] = None):
-    """Yield (label, output_string) per task sequentially."""
+    """Yield (label, output_string) per task, chunking if needed."""
     text = load_pdf_text(contract_path)
-    # No chunking: single full-context pass per task
-    enforced_model = model or _resolve_model()
-    agents, tasks, labels = build_agents_and_tasks(text, enforced_model)
+    # Chunk text to fit context window; 45k words ~ 60k tokens
+    # Overlap to preserve context between chunks
+    chunk_size = int(os.getenv("CHUNK_TOKENS", "45000"))
+    chunks = chunk_by_words(text, chunk_tokens=chunk_size, overlap_tokens=500)
+    num_chunks = len(chunks)
 
-    outputs: Dict[str, str] = {}
+    enforced_model = model or _resolve_model()
+    # Get a single set of agents+tasks, we'll re-use them
+    base_agents, base_tasks, labels = build_agents_and_tasks("{contract_text}", enforced_model)
+
+    outputs: Dict[str, Any] = {L: [] for L in labels}
 
     def _run_single(agent, task, dbg_label: str = "") -> str:
-        agents_list = [agent] if agent is not None else []
-        crew = Crew(agents=agents_list, tasks=[task], process=Process.sequential, verbose=False)
-        # Enforce per-task timeout
+        # Crew manages a single agent+task interaction
+        crew = Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False)
         timeout_sec = int(os.getenv("TASK_TIMEOUT_SEC", os.getenv("LITELLM_TIMEOUT", "240")))
         with ThreadPoolExecutor(max_workers=1) as ex:
             fut = ex.submit(crew.kickoff)
+            # This will raise TimeoutError if task exceeds limit
             _ = fut.result(timeout=timeout_sec)
-        raw = task.output.raw if hasattr(task, "output") else str(task.output)
-
-        # DEBUG: Log raw output for debugging
-        print(f"\n=== DEBUG: {dbg_label} RAW OUTPUT ===")
-        print(f"Raw output: {repr(raw)}")
-        print("=== END DEBUG ===\n")
-
+        # Robustly access raw output
+        raw = task.output.raw if hasattr(task, "output") and task.output else str(task.output or "")
         return raw
 
-    def _safe_json_list(val: str):
+    # Process each chunk sequentially against all tasks
+    for i, chunk in enumerate(chunks):
+        # Update progress for the frontend
+        progress = (i + 1) / num_chunks
+        if on_partial:
             try:
-                data = json.loads(val)
-                return data if isinstance(data, list) else []
+                on_partial("progress", {"_progress": progress, "chunk": i + 1, "total_chunks": num_chunks})
             except Exception:
-                return []
+                pass
+
+        # Create fresh tasks with the current chunk's content
+        # This is critical because task state is mutated on kickoff
+        _, chunk_tasks, _ = build_agents_and_tasks(chunk, enforced_model)
+
+        for agent, task, label in zip(base_agents, chunk_tasks, labels):
+            out_raw = _run_single(agent, task, f"{label} chunk {i+1}/{num_chunks}")
+            if out_raw:
+                outputs[label].append(out_raw)
+            # Optionally yield partial raw outputs as they complete
+            if on_partial:
+                try:
+                    on_partial(label, {f"{label}_raw_{i}": out_raw})
+                except Exception:
+                    pass
+
+    # MERGE RESULTS from all chunks
+    # This part is critical for creating a coherent final analysis
+
+    def _safe_json_list(val: str):
+        try:
+            # Use the robust sanitizer to handle malformed JSON
+            from src.utils.json_sanitizer import extract_json_array
+            data = extract_json_array(val)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
 
     def _merge_risks(risks_list):
+        # Flatten list of lists and deduplicate based on clause
+        all_risks = list(itertools.chain.from_iterable(risks_list))
         def score(r):
             sev = (r.get("severity", "").lower())
             s = 3 if sev == "high" else 2 if sev == "medium" else 1 if sev == "low" else 0
@@ -159,50 +194,53 @@ def run_analysis_iter(contract_path: Path, model: str | None = None, on_partial:
                 s += 1
             return s
         by_clause: Dict[str, Dict[str, Any]] = {}
-        for r in risks_list:
+        for r in all_risks:
             clause = str(r.get("clause", "")).strip()
             if not clause:
                 continue
             key = clause.lower()
+            # Keep the risk with the highest score if clauses are duplicated
             if key not in by_clause or score(r) > score(by_clause[key]):
                 by_clause[key] = r
+        # Sort by severity and return the top N
         merged = sorted(by_clause.values(), key=score, reverse=True)
-        return merged[:8]
+        return merged[:15] # Return more risks for long contracts
 
     def _merge_mitigations(mits_list, keep_for_clauses):
+        # Similar to risks, flatten, dedupe, and rank
+        all_mits = list(itertools.chain.from_iterable(mits_list))
         wanted = {c.lower() for c in keep_for_clauses}
         picked = []
         seen = set()
-        for m in mits_list:
+        for m in all_mits:
             clause = str(m.get("clause", ""))
-            if not clause:
-                continue
+            if not clause: continue
             key = clause.lower()
-            if key in seen:
-                continue
+            if key in seen: continue
             if key in wanted:
                 picked.append(m)
                 seen.add(key)
-        if len(picked) < 8:
-            for m in mits_list:
+        # If not enough mitigations for top risks, add others
+        if len(picked) < 15:
+            for m in all_mits:
                 clause = str(m.get("clause", ""))
                 key = clause.lower()
-                if not clause or key in seen:
-                    continue
+                if not clause or key in seen: continue
                 picked.append(m)
                 seen.add(key)
-                if len(picked) >= 8:
-                    break
-        return picked[:8]
+                if len(picked) >= 15: break
+        return picked[:15]
 
     def _alert_from_risks(risks):
+        # Logic remains the same, but operates on the merged risk list
         unfair = [r for r in risks if str(r.get("fairness", "").lower()) == "unfair"]
         high_unfair = [r for r in unfair if str(r.get("severity", "").lower()) == "high"]
-        exploit = bool(len(high_unfair) >= 1 or len(unfair) >= 3)
-        top_clauses = [r.get("clause", "") for r in risks[:5] if r.get("clause")]
+        exploit = bool(len(high_unfair) >= 2 or len(unfair) >= 5) # Stricter threshold for long docs
+        top_clauses = [r.get("clause", "") for r in risks[:8] if r.get("clause")]
         rationale = (
-            f"{len(unfair)} unfair clause(s), {len(high_unfair)} high severity. "
-            + ("Leans exploitative." if exploit else "Overall balanced/negotiable.")
+            f"Analysis of {num_chunks} document chunks found {len(unfair)} unfair clause(s), "
+            f"of which {len(high_unfair)} are high severity. "
+            + ("The contract leans exploitative." if exploit else "Overall contract is balanced/negotiable.")
         )
         return json.dumps({
             "exploitative": exploit,
@@ -210,21 +248,32 @@ def run_analysis_iter(contract_path: Path, model: str | None = None, on_partial:
             "top_unfair_clauses": top_clauses,
         }, ensure_ascii=False)
 
-    # No chunking or combining; single full-context pass per task
+    # Combine text summaries into a single summary
+    # For now, just join them. A summarization agent could improve this.
+    final_purpose = "\n\n".join(outputs.get("purpose", []))
+    final_commercial = "\n\n".join(outputs.get("commercial", [])) # Not ideal for JSON, but safe
+    final_plain = "\n\n".join(outputs.get("plain", []))
 
-    for agent, task, label in zip(agents, tasks, labels):
-        # Single full-context run for all tasks
-        out_raw = _run_single(agent, task, label)
-        out = out_raw or ""
-        if on_partial:
-            try:
-                on_partial(label, {f"{label}_raw": out_raw})
-            except Exception:
-                pass
-        if on_partial:
-            on_partial(label, {label: out, f"{label}_raw": out, "_progress": 1.0})
-        outputs[label] = str(out or "")
-        yield label, str(out or "")
+    # Process structured JSON outputs
+    legal_risks_chunks = [_safe_json_list(r) for r in outputs.get("legal_risks", [])]
+    merged_risks = _merge_risks(legal_risks_chunks)
+    final_legal_risks = json.dumps(merged_risks, indent=2, ensure_ascii=False)
+
+    mitigations_chunks = [_safe_json_list(m) for m in outputs.get("mitigations", [])]
+    risk_clauses = [r.get("clause", "") for r in merged_risks]
+    merged_mitigations = _merge_mitigations(mitigations_chunks, risk_clauses)
+    final_mitigations = json.dumps(merged_mitigations, indent=2, ensure_ascii=False)
+
+    # Generate final alert based on merged risks
+    final_alert = _alert_from_risks(merged_risks)
+
+    # Yield final, merged results
+    yield "purpose", final_purpose
+    yield "commercial", final_commercial
+    yield "legal_risks", final_legal_risks
+    yield "mitigations", final_mitigations
+    yield "alert", final_alert
+    yield "plain", final_plain
 
 
 def maybe_send_alert(alert_json: str, contract_name: str, pdf_path: Optional[Path] = None, recipient_override: Optional[str] = None) -> None:
